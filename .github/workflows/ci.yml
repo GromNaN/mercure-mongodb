@@ -45,18 +45,5 @@ jobs:
         with:
           go-version: "1.27"
 
-      - name: Wait for MongoDB to be healthy
-        run: |
-          for _ in $(seq 1 30); do
-            status=$(docker inspect --format '{{.State.Health.Status}}' \
-              ${{ job.services.mongodb.id }} 2>/dev/null || echo starting)
-            if [ "$status" = "healthy" ]; then
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "MongoDB did not become healthy in time" >&2
-          exit 1
-
       - name: Integration tests
         run: MONGODB_URI='mongodb://localhost:27017/?directConnection=true' go test -race -run TestIntegration -count=1 ./...
