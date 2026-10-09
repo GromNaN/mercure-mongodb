@@ -289,12 +289,12 @@ func TestGapIsBackfilledInOrder(t *testing.T) {
 
 	// The consumer sees only the third event. The two missing events must be
 	// backfilled from the durable collection, in order, before it.
-	tr.apply(docs[2])
+	require.NoError(t, tr.apply(docs[2]))
 
 	assert.Equal(t, []string{"1", "2", "3"}, readIDs(t, s, 3))
 
 	// A redelivered event is dropped.
-	tr.apply(docs[2])
+	require.NoError(t, tr.apply(docs[2]))
 	assertNoEvent(t, s)
 }
 
@@ -321,12 +321,66 @@ func TestLaggingHubDoesNotRedeliver(t *testing.T) {
 	require.NoError(t, tr.AddSubscriber(ctx, s))
 	assert.Equal(t, int64(5), tr.liveFloors[s])
 
-	tr.apply(docs[3]) // sequence 4, below the floor
-	tr.apply(docs[4]) // sequence 5, at the floor
+	require.NoError(t, tr.apply(docs[3])) // sequence 4, below the floor
+	require.NoError(t, tr.apply(docs[4])) // sequence 5, at the floor
 	assertNoEvent(t, s)
 
-	tr.apply(docs[5]) // sequence 6, above the floor
+	require.NoError(t, tr.apply(docs[5])) // sequence 6, above the floor
 	assert.Equal(t, []string{"6"}, readIDs(t, s, 1))
+}
+
+func TestUnfillableGapIsReported(t *testing.T) {
+	t.Parallel()
+
+	st := newMemoryStore()
+	tr := newBareTransport(st)
+	ctx := t.Context()
+
+	docs := make([]*eventDoc, 0, 3)
+
+	for i := 1; i <= 3; i++ {
+		doc := &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}
+		require.NoError(t, st.Append(ctx, doc))
+		docs = append(docs, doc)
+	}
+
+	// Retention removed the first two events, so the gap before the third event
+	// cannot be filled from the durable collection.
+	st.docs = st.docs[2:]
+
+	err := tr.apply(docs[2])
+	require.ErrorIs(t, err, errGapExpired)
+
+	// The watermark must not advance past the missing events.
+	assert.Equal(t, int64(0), tr.committed)
+}
+
+func TestRecoverGapDisconnectsSubscribers(t *testing.T) {
+	t.Parallel()
+
+	st := newMemoryStore()
+	tr := newBareTransport(st)
+	ctx := t.Context()
+
+	for i := 1; i <= 3; i++ {
+		require.NoError(t, st.Append(ctx, &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}))
+	}
+
+	s := newTestSubscriber(mercure.EarliestLastEventID, []string{testTopic}, nil)
+	require.NoError(t, tr.AddSubscriber(ctx, s))
+
+	require.NoError(t, tr.recoverGap())
+
+	// The watermark fast forwards to the latest event and the subscriber is
+	// disconnected, so the client reconnects and replays from its last event ID.
+	assert.Equal(t, int64(3), tr.committed)
+
+	select {
+	case _, ok := <-s.Receive():
+		require.False(t, ok, "the subscriber channel must be closed after a forced reset")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the subscriber was not disconnected")
+	}
 }
 
 func TestClosedTransportRejectsDispatch(t *testing.T) {

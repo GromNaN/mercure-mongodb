@@ -172,6 +172,17 @@ missed events. The consumer reads the missing range from the durable collection
 and delivers it in order before the event that revealed the gap. This makes
 delivery robust to a resume that silently skipped documents.
 
+A gap that the durable collection can no longer fill is handled explicitly. When
+retention removed events a lagging hub still needs, the missing range is gone for
+good. Retrying would loop, so the consumer disconnects every subscriber and fast
+forwards the watermark past the hole. Each client reconnects with its
+`Last-Event-ID` and replays from the durable collection, or is answered
+`earliest` when its position was removed. The transport never advances the
+watermark past a gap it could not fill, and it never delivers the event that
+revealed the gap before the range is complete. A catch up that fails for a
+transient reason is retried, and the hub does not report itself ready until the
+catch up succeeded.
+
 The hub exposes `Lag(ctx)`, the number of committed events it has not applied
 yet, so an operator can see a lagging instance.
 

@@ -97,12 +97,15 @@ func (m *MongoDB) Provision(ctx caddy.Context) error {
 }
 
 // key builds a stable transport key that identifies the connection and the hub
-// without exposing credentials.
+// without exposing credentials. Every option that changes the behavior of the
+// transport is part of the key, so two different configurations never share a
+// transport instance. The URI is hashed, so credentials never appear in the key.
 func (m *MongoDB) key(hubName string) string {
 	sum := sha256.Sum256([]byte(m.URI))
 
-	return fmt.Sprintf("mongodb:%s:%s:%s:%s",
-		hubName, m.Database, m.Collection, hex.EncodeToString(sum[:8]))
+	return fmt.Sprintf("mongodb:%s:%s:%s:%s:%s:%d:%d:%d:%d:%d",
+		hubName, m.Database, m.Collection, m.Checkpoints, hex.EncodeToString(sum[:8]),
+		m.Retention, m.CleanupInterval, m.CheckpointInterval, m.WatchAwaitTime, m.ConnectTimeout)
 }
 
 // Cleanup releases the transport.

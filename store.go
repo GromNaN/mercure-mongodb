@@ -44,9 +44,12 @@ type store interface {
 	// MaxSeq returns the highest committed sequence, or 0 when empty.
 	MaxSeq(ctx context.Context) (int64, error)
 
-	// FindByMercureID returns the sequence of the earliest document with the
-	// given visible Mercure ID.
-	FindByMercureID(ctx context.Context, mercureID string) (int64, bool, error)
+	// FindByMercureID returns the sequence of the earliest retained document
+	// with the given visible Mercure ID, and whether that document is the first
+	// occurrence of the ID. When the earliest retained occurrence is not the
+	// first occurrence, an earlier one was removed and the client position is
+	// ambiguous.
+	FindByMercureID(ctx context.Context, mercureID string) (seq int64, found bool, first bool, err error)
 
 	// Scan calls fn for every document with fromExclusive < Seq <= toInclusive,
 	// in sequence order. It stops early when fn returns false.
@@ -106,16 +109,15 @@ func (s *memoryStream) Close(context.Context) error {
 type memoryStore struct {
 	mu        sync.Mutex
 	docs      []*eventDoc
-	byID      map[string]int64
 	cp        *checkpoint
 	watchers  map[int]chan watchedEvent
 	nextWatch int
+	maxSeq    int64
 	closed    bool
 }
 
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
-		byID:     make(map[string]int64),
 		watchers: make(map[int]chan watchedEvent),
 	}
 }
@@ -128,16 +130,26 @@ func (s *memoryStore) Append(_ context.Context, doc *eventDoc) error {
 		return errStoreClosed
 	}
 
-	// The sequence is gapless: the next value is always len+1.
-	seq := int64(len(s.docs)) + 1
+	// The sequence is gapless and never decreases, even after Cleanup removes
+	// a prefix. This matches the MongoDB store, where _id is the max ever used.
+	seq := s.maxSeq + 1
+	s.maxSeq = seq
 	doc.Seq = seq
 
 	stored := *doc
-	s.docs = append(s.docs, &stored)
+	stored.First = true
 
-	if _, ok := s.byID[doc.MercureID]; !ok {
-		s.byID[doc.MercureID] = seq
+	// First is true when no retained document already has the visible ID. This
+	// matches the MongoDB store, which checks the collection.
+	for _, d := range s.docs {
+		if d.MercureID == doc.MercureID {
+			stored.First = false
+
+			break
+		}
 	}
+
+	s.docs = append(s.docs, &stored)
 
 	token := []byte{byte(seq)}
 
@@ -155,16 +167,20 @@ func (s *memoryStore) MaxSeq(context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return int64(len(s.docs)), nil
+	return s.maxSeq, nil
 }
 
-func (s *memoryStore) FindByMercureID(_ context.Context, mercureID string) (int64, bool, error) {
+func (s *memoryStore) FindByMercureID(_ context.Context, mercureID string) (int64, bool, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	seq, ok := s.byID[mercureID]
+	for _, d := range s.docs {
+		if d.MercureID == mercureID {
+			return d.Seq, true, d.First, nil
+		}
+	}
 
-	return seq, ok, nil
+	return 0, false, false, nil
 }
 
 func (s *memoryStore) Scan(_ context.Context, fromExclusive, toInclusive int64, fn func(*eventDoc) bool) error {
@@ -213,13 +229,6 @@ func (s *memoryStore) Cleanup(_ context.Context, retention int64) error {
 	}
 
 	drop := int64(len(s.docs)) - retention
-
-	for _, d := range s.docs[:drop] {
-		if s.byID[d.MercureID] == d.Seq {
-			delete(s.byID, d.MercureID)
-		}
-	}
-
 	s.docs = s.docs[drop:]
 
 	return nil

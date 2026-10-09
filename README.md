@@ -230,10 +230,15 @@ transport never logs the connection string.
 - **Change stream dependency.** Delivery needs a healthy change stream. The
   transport reports its health through `Ready` and `Live`, and reconnects with
   exponential backoff. A hub that loses the stream catches up from the durable
-  collection.
+  collection before it reports itself ready.
 - **Count-based retention only.** Retention keeps the newest N updates. There is
   no age-based expiry, because a TTL index could restart the internal sequence
   and break the replay/live boundary. Use count-based `retention` instead.
+- **Retention can outrun a subscriber.** If a subscriber lags behind further
+  than the retention window, the updates it still needs are deleted. The hub
+  detects the unfillable gap, disconnects the subscriber and fast forwards, so
+  the client reconnects and replays what remains. Size `retention` above the
+  worst expected subscriber lag.
 - **Do not drop the collection while hubs run.** Dropping or renaming the
   `updates` collection restarts the internal sequence. The transport logs an
   error and resets its watermark. This is a destructive operator action.

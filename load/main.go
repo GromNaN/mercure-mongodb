@@ -22,6 +22,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -87,10 +88,22 @@ func run(hub, publishToken, subscribeToken, topic string, clients, messages, rat
 	}
 	publishDone := time.Since(start)
 
-	// Wait for the clients to drain, or for the timeout.
-	deadline := time.Now().Add(timeout)
-	for received.Load() < target && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	// Wait for the clients to drain, or for the overall timeout.
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+drain:
+	for received.Load() < target {
+		select {
+		case <-ctx.Done():
+			break drain
+		case <-deadline.C:
+			break drain
+		case <-ticker.C:
+		}
 	}
 
 	elapsed := time.Since(start)
@@ -140,7 +153,8 @@ func subscribe(
 ) {
 	defer connected.Done()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"?topic="+topic, nil)
+	query := url.Values{"topic": {topic}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"?"+query.Encode(), nil)
 	if err != nil {
 		return
 	}
@@ -208,9 +222,12 @@ func publish(ctx context.Context, client *http.Client, hub, token, topic string,
 			}
 		}
 
-		body := fmt.Sprintf("topic=%s&data=%d %d", topic, i, time.Now().UnixNano())
+		form := url.Values{
+			"topic": {topic},
+			"data":  {fmt.Sprintf("%d %d", i, time.Now().UnixNano())},
+		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, hub, strings.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, hub, strings.NewReader(form.Encode()))
 		if err != nil {
 			return err
 		}

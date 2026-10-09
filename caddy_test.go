@@ -75,3 +75,33 @@ func TestKeyDoesNotLeakCredentials(t *testing.T) {
 	assert.NotContains(t, key, "user")
 	assert.True(t, strings.HasPrefix(key, "mongodb:hub-a:mercure:updates:"))
 }
+
+func TestKeyDistinguishesOptions(t *testing.T) {
+	t.Parallel()
+
+	base := MongoDB{
+		URI:        "mongodb://localhost:27017/?replicaSet=rs0",
+		Database:   "mercure",
+		Collection: "updates",
+	}
+
+	baseKey := base.key("hub-a")
+
+	variants := map[string]MongoDB{
+		"uri":                 {URI: "mongodb://localhost:27017/?replicaSet=rs1", Database: base.Database, Collection: base.Collection},
+		"database":            {URI: base.URI, Database: "other", Collection: base.Collection},
+		"collection":          {URI: base.URI, Database: base.Database, Collection: "other"},
+		"checkpoints":         {URI: base.URI, Database: base.Database, Collection: base.Collection, Checkpoints: "cp"},
+		"retention":           {URI: base.URI, Database: base.Database, Collection: base.Collection, Retention: 100},
+		"cleanup_interval":    {URI: base.URI, Database: base.Database, Collection: base.Collection, CleanupInterval: caddy.Duration(time.Minute)},
+		"checkpoint_interval": {URI: base.URI, Database: base.Database, Collection: base.Collection, CheckpointInterval: caddy.Duration(time.Minute)},
+		"watch_await_time":    {URI: base.URI, Database: base.Database, Collection: base.Collection, WatchAwaitTime: caddy.Duration(time.Minute)},
+		"connect_timeout":     {URI: base.URI, Database: base.Database, Collection: base.Collection, ConnectTimeout: caddy.Duration(time.Minute)},
+	}
+
+	for name, variant := range variants {
+		assert.NotEqual(t, baseKey, variant.key("hub-a"), "option %q must change the key", name)
+	}
+
+	assert.NotEqual(t, baseKey, base.key("hub-b"), "the hub name must change the key")
+}

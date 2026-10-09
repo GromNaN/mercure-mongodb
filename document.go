@@ -23,6 +23,12 @@ type eventDoc struct {
 	// publisher, so it is neither unique nor ordered.
 	MercureID string `bson:"mercure_id"`
 
+	// First is true when this document is the first occurrence of its visible
+	// Mercure ID. A Last-Event-ID that resolves to a document with First false
+	// had an earlier occurrence that was removed, so the client position is
+	// ambiguous and the transport answers "earliest".
+	First bool `bson:"first"`
+
 	Topics  []string `bson:"topics"`
 	Private bool     `bson:"private"`
 	Data    string   `bson:"data"`

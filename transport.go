@@ -36,6 +36,12 @@ const (
 // means the events collection was dropped or renamed and the sequence restarted.
 var errInvalidate = errors.New("mercure mongodb transport: events collection was dropped or renamed")
 
+// errGapExpired signals that the durable events needed to fill a change stream
+// gap were removed by retention. The hub cannot serve a contiguous stream to
+// the subscribers that are behind, so it disconnects them and they replay from
+// their Last-Event-ID.
+var errGapExpired = errors.New("mercure mongodb transport: the events needed to fill a change stream gap were removed by retention")
+
 // Config is the transport configuration. It is filled by the Caddy module and
 // can also be used to build a transport directly.
 type Config struct {
@@ -246,7 +252,7 @@ func (t *MongoDBTransport) AddSubscriber(ctx context.Context, s *mercure.LocalSu
 
 	// Resolve the client position before taking the lock, because it needs a
 	// database lookup.
-	haveSeq, found, resolveErr := t.resolveRequestedID(ctx, s)
+	haveSeq, found, first, resolveErr := t.resolveRequestedID(ctx, s)
 	if resolveErr != nil {
 		s.HistoryDispatched(mercure.EarliestLastEventID)
 
@@ -255,10 +261,15 @@ func (t *MongoDBTransport) AddSubscriber(ctx context.Context, s *mercure.LocalSu
 
 	// Snapshot and register in one critical section, shared with the consumer,
 	// so no event can slip between the snapshot and the registration.
+	//
+	// The live floor is the resolved client position only when that position is
+	// trustworthy, that is when the requested ID still maps to its first
+	// occurrence. Otherwise the subscriber is answered "earliest" and the floor
+	// is the snapshot.
 	t.mu.Lock()
 	bound := t.committed
 	liveFloor := bound
-	if haveSeq > liveFloor {
+	if found && first && haveSeq > liveFloor {
 		liveFloor = haveSeq
 	}
 
@@ -278,7 +289,7 @@ func (t *MongoDBTransport) AddSubscriber(ctx context.Context, s *mercure.LocalSu
 	}
 
 	if s.RequestLastEventIDSet {
-		if err := t.replay(ctx, s, bound, haveSeq, found); err != nil {
+		if err := t.replay(ctx, s, bound, haveSeq, found, first); err != nil {
 			return err
 		}
 	}
@@ -290,24 +301,26 @@ func (t *MongoDBTransport) AddSubscriber(ctx context.Context, s *mercure.LocalSu
 
 // resolveRequestedID resolves the requested Last-Event-ID to the highest
 // sequence the client already has. found is false when the id is unknown, was
-// removed by retention, or is empty.
-func (t *MongoDBTransport) resolveRequestedID(ctx context.Context, s *mercure.LocalSubscriber) (seq int64, found bool, err error) {
+// removed by retention, or is empty. first is false when the earliest retained
+// occurrence is not the first occurrence of the id, which means an earlier one
+// was removed and the client position is ambiguous.
+func (t *MongoDBTransport) resolveRequestedID(ctx context.Context, s *mercure.LocalSubscriber) (seq int64, found, first bool, err error) {
 	requested := s.RequestLastEventID
 	if requested == "" || requested == mercure.EarliestLastEventID {
-		return 0, false, nil
+		return 0, false, false, nil
 	}
 
-	seq, found, err = t.store.FindByMercureID(ctx, requested)
+	seq, found, first, err = t.store.FindByMercureID(ctx, requested)
 	if err != nil {
-		return 0, false, err
+		return 0, false, false, err
 	}
 
-	return seq, found, nil
+	return seq, found, first, nil
 }
 
 // replay sends the history the subscriber is missing, then calls
 // HistoryDispatched exactly once.
-func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscriber, bound, haveSeq int64, found bool) error {
+func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscriber, bound, haveSeq int64, found, first bool) error {
 	requested := s.RequestLastEventID
 
 	switch {
@@ -319,11 +332,13 @@ func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscribe
 
 		return t.replayRange(ctx, s, from, bound, mercure.EarliestLastEventID)
 
-	case !found:
-		// The requested id is unknown or was removed by retention. Answer
-		// "earliest" so the client reloads its state and reconnects.
+	case !found || !first:
+		// The requested id is unknown, was removed by retention, or resolves to
+		// a later occurrence whose first occurrence was removed. In all these
+		// cases the client position is unknown, so answer "earliest" and let the
+		// client reload its state and reconnect.
 		if t.logger != nil && t.logger.Enabled(ctx, slog.LevelInfo) {
-			t.logger.LogAttrs(ctx, slog.LevelInfo, "Requested Last-Event-ID not found in history",
+			t.logger.LogAttrs(ctx, slog.LevelInfo, "Requested Last-Event-ID does not resolve to a known position, answering earliest",
 				slog.String("mercure.last_event_id", requested))
 		}
 
@@ -332,8 +347,9 @@ func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscribe
 		return nil
 
 	default:
-		// The client already has everything up to haveSeq. Replay (haveSeq,
-		// bound], which is empty when this hub lags behind the client.
+		// The client already has everything up to haveSeq, and that occurrence
+		// is the first one, so replay (haveSeq, bound]. This is empty when this
+		// hub lags behind the client.
 		return t.replayRange(ctx, s, haveSeq, bound, requested)
 	}
 }
@@ -522,6 +538,20 @@ func (t *MongoDBTransport) consume() {
 			resumeToken = nil
 			backoff = reconnectMin
 
+		case errors.Is(err, errGapExpired):
+			if t.logger != nil {
+				t.logger.LogAttrs(t.ctx, slog.LevelError, "Change stream gap could not be filled from the durable collection", slog.Any("error", err))
+			}
+
+			// The missing events are gone for good, so retrying the same range
+			// would loop. Disconnect the subscribers and fast forward instead.
+			if recoverErr := t.recoverGap(); recoverErr != nil && t.logger != nil {
+				t.logger.LogAttrs(t.ctx, slog.LevelError, "Unable to recover from an expired change stream gap", slog.Any("error", recoverErr))
+			}
+
+			resumeToken = nil
+			backoff = reconnectMin
+
 		default:
 			if t.logger != nil {
 				t.logger.LogAttrs(t.ctx, slog.LevelError, "Change stream interrupted, reconnecting", slog.Any("error", err), slog.Duration("backoff", backoff))
@@ -549,15 +579,20 @@ func (t *MongoDBTransport) consumeOnce(resumeToken []byte) error {
 
 	defer stream.Close(context.Background()) //nolint:errcheck
 
-	t.healthy.Store(true)
-
 	// Open the stream before catching up, so events committed from now on are
 	// captured by the stream while the catch up fills the range that predates
 	// the stream. Without a resume token, the stream only sees events after it
 	// opened, so anything committed in between must come from the collection.
 	if len(resumeToken) == 0 {
-		t.catchUp()
+		if err := t.catchUp(); err != nil {
+			return err
+		}
 	}
+
+	// The stream is connected and caught up, so the hub can serve subscribers.
+	// Reporting ready before the catch up would advertise a hub that is still
+	// behind.
+	t.healthy.Store(true)
 
 	for {
 		ev, ok, err := stream.Next(t.ctx)
@@ -569,49 +604,82 @@ func (t *MongoDBTransport) consumeOnce(resumeToken []byte) error {
 			continue
 		}
 
-		t.mu.Lock()
-		t.lastToken = ev.Token
-		t.mu.Unlock()
-
 		switch ev.OperationType {
 		case opInvalidate:
 			return errInvalidate
 		case opInsert:
-			t.apply(ev.Doc)
+			if err := t.apply(ev.Doc); err != nil {
+				return err
+			}
 		default:
 			// A retention delete. It does not change the applied watermark.
 		}
+
+		// Advance the resume token only after the event was applied, so a
+		// failed apply re-reads the same event after the reconnect instead of
+		// skipping it.
+		t.mu.Lock()
+		t.lastToken = ev.Token
+		t.mu.Unlock()
 	}
 }
 
 // apply delivers one event, first filling any gap between the applied watermark
-// and the event sequence from the durable collection.
-func (t *MongoDBTransport) apply(doc *eventDoc) {
+// and the event sequence from the durable collection. It returns an error when
+// the gap cannot be filled, so the caller does not advance past missing events.
+func (t *MongoDBTransport) apply(doc *eventDoc) error {
 	t.mu.Lock()
 	committed := t.committed
 	t.mu.Unlock()
 
 	if doc.Seq <= committed {
-		return // duplicate, for example after a resume
+		return nil // duplicate, for example after a resume
 	}
 
 	if doc.Seq > committed+1 {
-		if err := t.backfill(committed, doc.Seq-1); err != nil && t.logger != nil {
-			t.logger.LogAttrs(t.ctx, slog.LevelError, "Unable to backfill a change stream gap", slog.Any("error", err), slog.Int64("from", committed+1), slog.Int64("to", doc.Seq-1))
+		if err := t.backfill(committed, doc.Seq-1); err != nil {
+			return fmt.Errorf("backfilling change stream gap (%d, %d]: %w", committed, doc.Seq-1, err)
 		}
 	}
 
 	t.deliver(doc)
+
+	return nil
 }
 
 // backfill delivers the durable events in (fromExclusive, toInclusive] to live
-// subscribers, in order.
+// subscribers, in order. It returns errGapExpired when the range is not fully
+// covered, which means retention removed events that are still needed. In that
+// case nothing is delivered, so the caller can reset instead of exposing a hole
+// in the stream.
 func (t *MongoDBTransport) backfill(fromExclusive, toInclusive int64) error {
-	return t.store.Scan(t.ctx, fromExclusive, toInclusive, func(doc *eventDoc) bool {
+	expected := fromExclusive + 1
+	expired := false
+
+	err := t.store.Scan(t.ctx, fromExclusive, toInclusive, func(doc *eventDoc) bool {
+		if doc.Seq != expected {
+			// The range has a hole, which only retention can cause. Stop before
+			// delivering anything, so subscribers never see a partial range.
+			expired = true
+
+			return false
+		}
+
+		expected = doc.Seq + 1
+
 		t.deliver(doc)
 
 		return true
 	})
+	if err != nil {
+		return err
+	}
+
+	if expired || expected <= toInclusive {
+		return errGapExpired
+	}
+
+	return nil
 }
 
 // deliver advances the watermark and dispatches the event to matching
@@ -654,15 +722,13 @@ func (t *MongoDBTransport) deliver(doc *eventDoc) {
 
 // catchUp delivers every committed event the hub has not applied yet. It is
 // used when the resume token is no longer valid, so connected subscribers do
-// not lose the events published during the interruption.
-func (t *MongoDBTransport) catchUp() {
+// not lose the events published during the interruption. It returns an error
+// when the range cannot be read or is no longer retained, so the consumer can
+// retry or reset instead of silently staying behind.
+func (t *MongoDBTransport) catchUp() error {
 	max, err := t.store.MaxSeq(t.ctx)
 	if err != nil {
-		if t.logger != nil {
-			t.logger.LogAttrs(t.ctx, slog.LevelError, "Unable to read the maximum sequence while catching up", slog.Any("error", err))
-		}
-
-		return
+		return fmt.Errorf("reading the maximum sequence while catching up: %w", err)
 	}
 
 	t.mu.Lock()
@@ -670,12 +736,58 @@ func (t *MongoDBTransport) catchUp() {
 	t.mu.Unlock()
 
 	if max <= from {
-		return
+		return nil
 	}
 
-	if err := t.backfill(from, max); err != nil && t.logger != nil {
-		t.logger.LogAttrs(t.ctx, slog.LevelError, "Unable to catch up from the durable collection", slog.Any("error", err))
+	if err := t.backfill(from, max); err != nil {
+		return fmt.Errorf("catching up from the durable collection: %w", err)
 	}
+
+	return nil
+}
+
+// recoverGap handles a gap that retention made unfillable. The subscribers
+// cannot be served a contiguous stream, so they are disconnected and the
+// watermark is fast forwarded past the missing events. Each client reconnects
+// with its Last-Event-ID and replays from the durable collection.
+func (t *MongoDBTransport) recoverGap() error {
+	max, err := t.store.MaxSeq(t.ctx)
+	if err != nil {
+		return fmt.Errorf("reading the maximum sequence while recovering a gap: %w", err)
+	}
+
+	latest, err := t.store.Latest(t.ctx)
+	if err != nil {
+		return fmt.Errorf("reading the latest event while recovering a gap: %w", err)
+	}
+
+	var subscribers []*mercure.LocalSubscriber
+
+	t.mu.Lock()
+	t.committed = max
+	if latest != nil {
+		t.lastEventID = latest.MercureID
+	}
+
+	t.liveFloors = make(map[*mercure.LocalSubscriber]int64)
+
+	t.subscribers.Walk(0, func(s *mercure.LocalSubscriber) bool {
+		subscribers = append(subscribers, s)
+
+		return true
+	})
+	t.mu.Unlock()
+
+	for _, s := range subscribers {
+		s.Disconnect()
+	}
+
+	if t.logger != nil {
+		t.logger.LogAttrs(t.ctx, slog.LevelError, "Change stream gap could not be filled from the durable collection, disconnecting subscribers to force a replay",
+			slog.Int64("committed", max), slog.Int("subscribers", len(subscribers)))
+	}
+
+	return nil
 }
 
 // reset restarts the watermark after the events collection was dropped.

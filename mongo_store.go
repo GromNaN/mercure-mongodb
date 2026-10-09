@@ -121,9 +121,11 @@ func (s *mongoStore) checkChangeStreamSupport(ctx context.Context) error {
 
 	err := s.client.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
 	if err != nil {
-		// The command may be denied by a restricted user. The change stream
-		// open will surface a standalone deployment with its own error.
-		return nil //nolint:nilerr
+		// The driver runs the same handshake command on every connection, so a
+		// working connection implies this command is allowed. Failing here means
+		// the deployment or the credentials are wrong, which must stop startup
+		// rather than defer to a change stream error later.
+		return fmt.Errorf("reading the deployment topology: %w", err)
 	}
 
 	if msg, _ := hello["msg"].(string); msg == "isdbgrid" {
@@ -160,6 +162,17 @@ func (s *mongoStore) Append(ctx context.Context, doc *eventDoc) error {
 	if s.closed.Load() {
 		return errStoreClosed
 	}
+
+	// Record whether this is the first occurrence of the visible ID, so a
+	// Last-Event-ID that resolves to a later occurrence can be detected as
+	// ambiguous after retention removed the first one. The lookup uses the
+	// compound index and is outside the allocation lock.
+	first, err := s.isFirstOccurrence(ctx, doc.MercureID)
+	if err != nil {
+		return err
+	}
+
+	doc.First = first
 
 	// Serialize local allocation so local publishes never collide with each
 	// other. Cross hub collisions are resolved by the retry loop below.
@@ -212,9 +225,11 @@ func (s *mongoStore) MaxSeq(ctx context.Context) (int64, error) {
 	return doc.Seq, nil
 }
 
-// FindByMercureID returns the sequence of the earliest document with the given
-// visible Mercure ID.
-func (s *mongoStore) FindByMercureID(ctx context.Context, mercureID string) (int64, bool, error) {
+// FindByMercureID returns the sequence of the earliest retained document with
+// the given visible Mercure ID, and whether that document is the first
+// occurrence of the ID. When First is false, an earlier occurrence was removed
+// by retention, so the client position is ambiguous.
+func (s *mongoStore) FindByMercureID(ctx context.Context, mercureID string) (int64, bool, bool, error) {
 	var doc eventDoc
 
 	err := s.events.FindOne(ctx,
@@ -222,14 +237,32 @@ func (s *mongoStore) FindByMercureID(ctx context.Context, mercureID string) (int
 		options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}}),
 	).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		return 0, false, nil
+		return 0, false, false, nil
 	}
 
 	if err != nil {
-		return 0, false, fmt.Errorf("looking up Last-Event-ID: %w", err)
+		return 0, false, false, fmt.Errorf("looking up Last-Event-ID: %w", err)
 	}
 
-	return doc.Seq, true, nil
+	return doc.Seq, true, doc.First, nil
+}
+
+// isFirstOccurrence reports whether no retained document already has the given
+// visible Mercure ID.
+func (s *mongoStore) isFirstOccurrence(ctx context.Context, mercureID string) (bool, error) {
+	err := s.events.FindOne(ctx,
+		bson.D{{Key: "mercure_id", Value: mercureID}},
+		options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}}),
+	).Err()
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return true, nil
+	}
+
+	if err != nil {
+		return false, fmt.Errorf("checking the visible ID: %w", err)
+	}
+
+	return false, nil
 }
 
 // Scan calls fn for every document with fromExclusive < Seq <= toInclusive, in
