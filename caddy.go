@@ -64,24 +64,14 @@ func (m *MongoDB) Provision(ctx caddy.Context) error {
 	hubName, _ := ctx.Value(mercurecaddy.HubNameContextKey).(string)
 	m.transportKey = m.key(hubName)
 
+	cfg := m.effectiveConfig(hubName)
+
 	destructor, _, err := mercurecaddy.TransportUsagePool.LoadOrNew(m.transportKey, func() (caddy.Destructor, error) {
 		t, err := NewMongoDBTransport(
 			ctx,
 			mercure.NewSubscriberList(ctx.Value(mercurecaddy.SubscriberListCacheSizeContextKey).(int)), //nolint:forcetypeassert
 			ctx.Slogger(),
-			Config{
-				URI:                m.URI,
-				Database:           m.Database,
-				Collection:         m.Collection,
-				Checkpoints:        m.Checkpoints,
-				Seen:               m.Seen,
-				Retention:          m.Retention,
-				CleanupInterval:    time.Duration(m.CleanupInterval),
-				CheckpointInterval: time.Duration(m.CheckpointInterval),
-				WatchAwaitTime:     time.Duration(m.WatchAwaitTime),
-				ConnectTimeout:     time.Duration(m.ConnectTimeout),
-				HubName:            hubName,
-			},
+			cfg,
 		)
 		if err != nil {
 			return nil, err
@@ -98,16 +88,40 @@ func (m *MongoDB) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// effectiveConfig builds the transport configuration with defaults applied, so
+// the pool key and the transport agree on every value. An omitted option and its
+// explicit default must produce the same key, otherwise equivalent handlers open
+// duplicate change streams and checkpoint and cleanup loops.
+func (m *MongoDB) effectiveConfig(hubName string) Config {
+	cfg := Config{
+		URI:                m.URI,
+		Database:           m.Database,
+		Collection:         m.Collection,
+		Checkpoints:        m.Checkpoints,
+		Seen:               m.Seen,
+		Retention:          m.Retention,
+		CleanupInterval:    time.Duration(m.CleanupInterval),
+		CheckpointInterval: time.Duration(m.CheckpointInterval),
+		WatchAwaitTime:     time.Duration(m.WatchAwaitTime),
+		ConnectTimeout:     time.Duration(m.ConnectTimeout),
+		HubName:            hubName,
+	}
+	cfg.withDefaults()
+
+	return cfg
+}
+
 // key builds a stable transport key that identifies the connection and the hub
-// without exposing credentials. Every option that changes the behavior of the
-// transport is part of the key, so two different configurations never share a
-// transport instance. The URI is hashed, so credentials never appear in the key.
+// without exposing credentials. Every effective option is part of the key, so
+// two different configurations never share a transport instance. The URI is
+// hashed, so credentials never appear in the key.
 func (m *MongoDB) key(hubName string) string {
-	sum := sha256.Sum256([]byte(m.URI))
+	cfg := m.effectiveConfig(hubName)
+	sum := sha256.Sum256([]byte(cfg.URI))
 
 	return fmt.Sprintf("mongodb:%s:%s:%s:%s:%s:%s:%d:%d:%d:%d:%d",
-		hubName, m.Database, m.Collection, m.Checkpoints, m.Seen, hex.EncodeToString(sum[:8]),
-		m.Retention, m.CleanupInterval, m.CheckpointInterval, m.WatchAwaitTime, m.ConnectTimeout)
+		hubName, cfg.Database, cfg.Collection, cfg.Checkpoints, cfg.Seen, hex.EncodeToString(sum[:8]),
+		cfg.Retention, cfg.CleanupInterval, cfg.CheckpointInterval, cfg.WatchAwaitTime, cfg.ConnectTimeout)
 }
 
 // Cleanup releases the transport.
