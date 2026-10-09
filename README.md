@@ -41,32 +41,7 @@ instance opens a change stream on that collection. A publish appends a document;
 the change stream delivers it to every hub, including the one that published, so
 there is a single ordered delivery path and no duplicate.
 
-```mermaid
-flowchart TB
-    Pub["Publisher"]
-
-    subgraph Hubs["Caddy hubs (Mercure)"]
-        A["hub A<br/>mercure handler<br/>mongodb transport"]
-        B["hub B<br/>mercure handler<br/>mongodb transport"]
-    end
-
-    S1["Subscribers"]
-    S2["Subscribers"]
-
-    M[("MongoDB replica set<br/>updates + checkpoints")]
-
-    Pub -->|"POST /hub"| A
-    Pub -->|"POST /hub"| B
-
-    A -->|"insert one event"| M
-    B -->|"insert one event"| M
-
-    M -.->|"change stream"| A
-    M -.->|"change stream"| B
-
-    A -->|SSE| S1
-    B -->|SSE| S2
-```
+![Architecture: a publisher posts to any Mercure hub. Each hub inserts one event document into a MongoDB replica set. Every hub reads the collection through a change stream, so an update published on any hub reaches every subscriber on every hub over SSE](docs/architecture.svg)
 
 The internal cursor is a gapless sequence stored as `_id`. A hub keeps an
 applied watermark and, for each subscriber, a live floor. Replay sends history
