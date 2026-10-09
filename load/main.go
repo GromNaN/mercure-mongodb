@@ -56,8 +56,9 @@ func run(hub, publishToken, subscribeToken, topic string, clients, messages, rat
 	latencies := &collector{}
 
 	var (
-		received  atomic.Int64
-		connected sync.WaitGroup
+		received     atomic.Int64
+		connectFails atomic.Int64
+		connected    sync.WaitGroup
 	)
 
 	connected.Add(clients)
@@ -75,12 +76,18 @@ func run(hub, publishToken, subscribeToken, topic string, clients, messages, rat
 	defer stopClients()
 
 	for range clients {
-		go subscribe(clientCtx, client, hub, subscribeToken, topic, latencies, &received, &connected, target, stopClients)
+		go subscribe(clientCtx, client, hub, subscribeToken, topic, latencies, &received, &connectFails, &connected, target, stopClients)
 	}
 
 	// Wait for every client to be connected before publishing, so the measured
 	// latency is not polluted by connection setup.
-	waitWithTimeout(&connected, 30*time.Second)
+	if !waitWithTimeout(&connected, 30*time.Second) {
+		return fmt.Errorf("timed out after 30s waiting for %d clients to connect", clients)
+	}
+
+	if failed := connectFails.Load(); failed > 0 {
+		return fmt.Errorf("%d of %d clients failed to connect", failed, clients)
+	}
 
 	start := time.Now()
 	if err := publish(ctx, client, hub, publishToken, topic, messages, rate); err != nil {
@@ -128,7 +135,7 @@ drain:
 	return nil
 }
 
-func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) {
+func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -137,7 +144,9 @@ func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) {
 
 	select {
 	case <-done:
+		return true
 	case <-time.After(timeout):
+		return false
 	}
 }
 
@@ -147,15 +156,22 @@ func subscribe(
 	hub, token, topic string,
 	latencies *collector,
 	received *atomic.Int64,
+	connectFails *atomic.Int64,
 	connected *sync.WaitGroup,
 	target int64,
 	stop func(),
 ) {
-	defer connected.Done()
+	var once sync.Once
+	done := func() { once.Do(connected.Done) }
+	// The read loop can outlive the connection phase, so the deferred call is
+	// only a safety net. It must not double count with the signal below.
+	defer done()
 
 	query := url.Values{"topic": {topic}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"?"+query.Encode(), nil)
 	if err != nil {
+		connectFails.Add(1)
+
 		return
 	}
 
@@ -165,14 +181,22 @@ func subscribe(
 
 	resp, err := client.Do(req)
 	if err != nil {
+		connectFails.Add(1)
+
 		return
 	}
 
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
+		connectFails.Add(1)
+
 		return
 	}
+
+	// The connection is established: report readiness now, before the read loop
+	// that runs until the run finishes.
+	done()
 
 	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 
