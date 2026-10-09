@@ -341,7 +341,9 @@ func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscribe
 			from = bound - limit
 		}
 
-		return t.replayRange(ctx, s, from, bound, mercure.EarliestLastEventID)
+		// The "earliest" window may start before the oldest retained event, so a
+		// partial range is expected and complete is false.
+		return t.replayRange(ctx, s, from, bound, mercure.EarliestLastEventID, false)
 
 	case !found || !first:
 		// The requested id is unknown, was removed by retention, or resolves to
@@ -360,15 +362,33 @@ func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscribe
 	default:
 		// The client already has everything up to haveSeq, and that occurrence
 		// is the first one, so replay (haveSeq, bound]. This is empty when this
-		// hub lags behind the client.
-		return t.replayRange(ctx, s, haveSeq, bound, requested)
+		// hub lags behind the client. The range must be complete: retention can
+		// delete events between the lookup and the scan, and a partial range
+		// would silently skip updates.
+		return t.replayRange(ctx, s, haveSeq, bound, requested, true)
 	}
 }
 
 // replayRange dispatches matching events in (fromExclusive, toInclusive] as
-// history, then calls HistoryDispatched exactly once.
-func (t *MongoDBTransport) replayRange(ctx context.Context, s *mercure.LocalSubscriber, fromExclusive, toInclusive int64, responseLastEventID string) error {
+// history, then calls HistoryDispatched exactly once. When complete is true and
+// the range is not fully covered, the subscriber is answered "earliest" instead
+// of being served a partial range, because retention removed events between the
+// lookup and the scan.
+func (t *MongoDBTransport) replayRange(ctx context.Context, s *mercure.LocalSubscriber, fromExclusive, toInclusive int64, responseLastEventID string, complete bool) error {
+	expected := fromExclusive + 1
+	incomplete := false
+
 	err := t.store.Scan(ctx, fromExclusive, toInclusive, func(doc *eventDoc) bool {
+		if doc.Seq != expected {
+			// The range has a hole, which only retention can cause. Stop before
+			// dispatching the suffix.
+			incomplete = true
+
+			return false
+		}
+
+		expected = doc.Seq + 1
+
 		update := doc.update()
 		if !s.Match(update) {
 			return true
@@ -380,6 +400,17 @@ func (t *MongoDBTransport) replayRange(ctx context.Context, s *mercure.LocalSubs
 		s.HistoryDispatched(mercure.EarliestLastEventID)
 
 		return err
+	}
+
+	if complete && (incomplete || expected <= toInclusive) {
+		if t.logger != nil && t.logger.Enabled(ctx, slog.LevelInfo) {
+			t.logger.LogAttrs(ctx, slog.LevelInfo, "Replay range was partly removed by retention, answering earliest",
+				slog.String("mercure.last_event_id", responseLastEventID), slog.Int64("from", fromExclusive), slog.Int64("to", toInclusive))
+		}
+
+		s.HistoryDispatched(mercure.EarliestLastEventID)
+
+		return nil
 	}
 
 	s.HistoryDispatched(responseLastEventID)

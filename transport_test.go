@@ -418,6 +418,31 @@ func TestRepeatedIDAfterRetentionIsAmbiguous(t *testing.T) {
 	assertNoEvent(t, s)
 }
 
+func TestReplayRangeWithRetentionHoleAnswersEarliest(t *testing.T) {
+	t.Parallel()
+
+	st := newMemoryStore()
+	tr := newBareTransport(st)
+	ctx := t.Context()
+
+	for i := 1; i <= 5; i++ {
+		require.NoError(t, st.Append(ctx, &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}))
+	}
+
+	// Retention removed the prefix that the replay range needed, leaving only
+	// the newest events. This is the race between the Last-Event-ID lookup and
+	// the scan: the position was found, then the events after it were deleted.
+	st.docs = st.docs[3:] // keeps sequences 4 and 5
+
+	s := newTestSubscriber("2", []string{testTopic}, nil)
+
+	// The requested position and the events that follow it were removed, so the
+	// range is not contiguous: the subscriber is answered earliest instead of
+	// being served a suffix with a hole.
+	require.NoError(t, tr.replayRange(ctx, s, 2, 5, "2", true))
+	assertNoEvent(t, s)
+}
+
 func TestClosedTransportRejectsDispatch(t *testing.T) {
 	t.Parallel()
 
