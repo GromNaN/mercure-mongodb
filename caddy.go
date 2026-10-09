@@ -29,6 +29,7 @@ type MongoDB struct {
 	Database    string `json:"database,omitempty"`
 	Collection  string `json:"collection,omitempty"`
 	Checkpoints string `json:"checkpoints,omitempty"`
+	Seen        string `json:"seen,omitempty"`
 
 	Retention int64 `json:"retention,omitempty"`
 
@@ -73,6 +74,7 @@ func (m *MongoDB) Provision(ctx caddy.Context) error {
 				Database:           m.Database,
 				Collection:         m.Collection,
 				Checkpoints:        m.Checkpoints,
+				Seen:               m.Seen,
 				Retention:          m.Retention,
 				CleanupInterval:    time.Duration(m.CleanupInterval),
 				CheckpointInterval: time.Duration(m.CheckpointInterval),
@@ -103,8 +105,8 @@ func (m *MongoDB) Provision(ctx caddy.Context) error {
 func (m *MongoDB) key(hubName string) string {
 	sum := sha256.Sum256([]byte(m.URI))
 
-	return fmt.Sprintf("mongodb:%s:%s:%s:%s:%s:%d:%d:%d:%d:%d",
-		hubName, m.Database, m.Collection, m.Checkpoints, hex.EncodeToString(sum[:8]),
+	return fmt.Sprintf("mongodb:%s:%s:%s:%s:%s:%s:%d:%d:%d:%d:%d",
+		hubName, m.Database, m.Collection, m.Checkpoints, m.Seen, hex.EncodeToString(sum[:8]),
 		m.Retention, m.CleanupInterval, m.CheckpointInterval, m.WatchAwaitTime, m.ConnectTimeout)
 }
 
@@ -147,6 +149,13 @@ func (m *MongoDB) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 
 				m.Checkpoints = d.Val()
+
+			case "seen":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				m.Seen = d.Val()
 
 			case "retention":
 				if !d.NextArg() {

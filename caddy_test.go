@@ -19,6 +19,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		database mercuredb
 		collection events
 		checkpoints cp
+		seen seenids
 		retention 100
 		cleanup_interval 1m
 		checkpoint_interval 2s
@@ -33,6 +34,7 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	assert.Equal(t, "mercuredb", m.Database)
 	assert.Equal(t, "events", m.Collection)
 	assert.Equal(t, "cp", m.Checkpoints)
+	assert.Equal(t, "seenids", m.Seen)
 	assert.Equal(t, int64(100), m.Retention)
 	assert.Equal(t, caddy.Duration(time.Minute), m.CleanupInterval)
 	assert.Equal(t, caddy.Duration(2*time.Second), m.CheckpointInterval)
