@@ -31,6 +31,7 @@ type mongoStore struct {
 	client      *mongo.Client
 	events      *mongo.Collection
 	checkpoints *mongo.Collection
+	seen        *mongo.Collection
 	hubName     string
 	watchAwait  time.Duration
 
@@ -52,6 +53,7 @@ type mongoConfig struct {
 	Database       string
 	Collection     string
 	Checkpoints    string
+	Seen           string
 	HubName        string
 	WatchAwaitTime time.Duration
 	ConnectTimeout time.Duration
@@ -86,6 +88,7 @@ func newMongoStore(ctx context.Context, cfg mongoConfig) (*mongoStore, error) {
 		client:      client,
 		events:      client.Database(cfg.Database).Collection(cfg.Collection),
 		checkpoints: client.Database(cfg.Database).Collection(cfg.Checkpoints),
+		seen:        client.Database(cfg.Database).Collection(cfg.Seen),
 		hubName:     cfg.HubName,
 		watchAwait:  cfg.WatchAwaitTime,
 	}
@@ -165,9 +168,13 @@ func (s *mongoStore) Append(ctx context.Context, doc *eventDoc) error {
 
 	// Record whether this is the first occurrence of the visible ID, so a
 	// Last-Event-ID that resolves to a later occurrence can be detected as
-	// ambiguous after retention removed the first one. The lookup uses the
-	// compound index and is outside the allocation lock.
-	first, err := s.isFirstOccurrence(ctx, doc.MercureID)
+	// ambiguous after retention removed the first one. The marker lives in its
+	// own collection, outside the retention window, so a later occurrence is
+	// never mistaken for the first one. The upsert is atomic on a single
+	// document, so concurrent publishers of the same new ID agree on which
+	// occurrence is the first. A failed insert can leave a marker behind, which
+	// only makes the transport answer "earliest" more often, never skip events.
+	first, err := s.markSeen(ctx, doc.MercureID)
 	if err != nil {
 		return err
 	}
@@ -247,22 +254,21 @@ func (s *mongoStore) FindByMercureID(ctx context.Context, mercureID string) (int
 	return doc.Seq, true, doc.First, nil
 }
 
-// isFirstOccurrence reports whether no retained document already has the given
-// visible Mercure ID.
-func (s *mongoStore) isFirstOccurrence(ctx context.Context, mercureID string) (bool, error) {
-	err := s.events.FindOne(ctx,
-		bson.D{{Key: "mercure_id", Value: mercureID}},
-		options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}}),
-	).Err()
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return true, nil
-	}
-
+// markSeen records the visible Mercure ID in the seen collection and reports
+// whether this call created the marker, that is whether the ID had never been
+// published before. The upsert is atomic on a single document, so two publishers
+// of the same new ID cannot both observe it as new.
+func (s *mongoStore) markSeen(ctx context.Context, mercureID string) (bool, error) {
+	res, err := s.seen.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: mercureID}},
+		bson.D{{Key: "$setOnInsert", Value: bson.D{{Key: "created_at", Value: time.Now().UTC()}}}},
+		options.UpdateOne().SetUpsert(true),
+	)
 	if err != nil {
-		return false, fmt.Errorf("checking the visible ID: %w", err)
+		return false, fmt.Errorf("marking the visible ID as seen: %w", err)
 	}
 
-	return false, nil
+	return res.UpsertedCount > 0, nil
 }
 
 // Scan calls fn for every document with fromExclusive < Seq <= toInclusive, in

@@ -136,6 +136,7 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Equal(t, DefaultDatabase, cfg.Database)
 	assert.Equal(t, DefaultCollection, cfg.Collection)
 	assert.Equal(t, DefaultCheckpoints, cfg.Checkpoints)
+	assert.Equal(t, DefaultSeen, cfg.Seen)
 	assert.Equal(t, DefaultCleanupInterval, cfg.CleanupInterval)
 	assert.Equal(t, DefaultCheckpointInterval, cfg.CheckpointInterval)
 	assert.Equal(t, DefaultWatchAwaitTime, cfg.WatchAwaitTime)
@@ -381,6 +382,40 @@ func TestRecoverGapDisconnectsSubscribers(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the subscriber was not disconnected")
 	}
+}
+
+func TestRepeatedIDAfterRetentionIsAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	st := newMemoryStore()
+	tr := newBareTransport(st)
+	ctx := t.Context()
+
+	require.NoError(t, st.Append(ctx, &eventDoc{MercureID: "X", Topics: []string{testTopic}, Data: "1"}))
+
+	for i := 2; i <= 5; i++ {
+		require.NoError(t, st.Append(ctx, &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}))
+	}
+
+	// Retention removes the first occurrence of X.
+	require.NoError(t, st.Cleanup(ctx, 3))
+
+	second := &eventDoc{MercureID: "X", Topics: []string{testTopic}, Data: "2"}
+	require.NoError(t, st.Append(ctx, second))
+	require.False(t, second.First, "a repeated ID must not be the first occurrence after retention removed the earlier one")
+
+	for i := 7; i <= 9; i++ {
+		require.NoError(t, st.Append(ctx, &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}))
+	}
+
+	tr.committed = 9
+
+	// A client that saw the deleted first occurrence of X reconnects. Its
+	// position is ambiguous, so it must be answered earliest, not served the
+	// events after the second occurrence.
+	s := newTestSubscriber("X", []string{testTopic}, nil)
+	require.NoError(t, tr.AddSubscriber(ctx, s))
+	assertNoEvent(t, s)
 }
 
 func TestClosedTransportRejectsDispatch(t *testing.T) {

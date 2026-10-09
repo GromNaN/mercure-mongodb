@@ -113,12 +113,16 @@ type memoryStore struct {
 	watchers  map[int]chan watchedEvent
 	nextWatch int
 	maxSeq    int64
-	closed    bool
+	// seen records every visible Mercure ID ever appended. It is not subject to
+	// Cleanup, so a repeated ID is never mistaken for a first occurrence.
+	seen   map[string]struct{}
+	closed bool
 }
 
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
 		watchers: make(map[int]chan watchedEvent),
+		seen:     make(map[string]struct{}),
 	}
 }
 
@@ -137,17 +141,13 @@ func (s *memoryStore) Append(_ context.Context, doc *eventDoc) error {
 	doc.Seq = seq
 
 	stored := *doc
-	stored.First = true
 
-	// First is true when no retained document already has the visible ID. This
-	// matches the MongoDB store, which checks the collection.
-	for _, d := range s.docs {
-		if d.MercureID == doc.MercureID {
-			stored.First = false
-
-			break
-		}
-	}
+	// First is true when the visible ID was never appended before. The marker
+	// survives Cleanup, matching the MongoDB store, which keeps it in a separate
+	// collection outside retention.
+	_, alreadySeen := s.seen[doc.MercureID]
+	stored.First = !alreadySeen
+	s.seen[doc.MercureID] = struct{}{}
 
 	s.docs = append(s.docs, &stored)
 

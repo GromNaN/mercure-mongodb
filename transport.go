@@ -17,6 +17,7 @@ const (
 	DefaultDatabase           = "mercure"
 	DefaultCollection         = "updates"
 	DefaultCheckpoints        = "checkpoints"
+	DefaultSeen               = "seen_ids"
 	DefaultCleanupInterval    = 30 * time.Second
 	DefaultCheckpointInterval = time.Second
 	DefaultWatchAwaitTime     = time.Second
@@ -53,6 +54,11 @@ type Config struct {
 	Collection  string
 	Checkpoints string
 
+	// Seen is the collection that records which visible Mercure IDs have ever
+	// been published. It is not subject to retention, so a repeated ID is never
+	// mistaken for a first occurrence after the earlier one was deleted.
+	Seen string
+
 	// Retention is the number of newest events kept. 0 keeps everything.
 	Retention int64
 
@@ -76,6 +82,10 @@ func (c *Config) withDefaults() {
 
 	if c.Checkpoints == "" {
 		c.Checkpoints = DefaultCheckpoints
+	}
+
+	if c.Seen == "" {
+		c.Seen = DefaultSeen
 	}
 
 	if c.CleanupInterval <= 0 {
@@ -144,6 +154,7 @@ func NewMongoDBTransport(ctx context.Context, subscribers *mercure.SubscriberLis
 		Database:       cfg.Database,
 		Collection:     cfg.Collection,
 		Checkpoints:    cfg.Checkpoints,
+		Seen:           cfg.Seen,
 		HubName:        cfg.HubName,
 		WatchAwaitTime: cfg.WatchAwaitTime,
 		ConnectTimeout: cfg.ConnectTimeout,
