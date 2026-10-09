@@ -1,7 +1,7 @@
 # mercure-mongodb
 
 [![CI](https://github.com/GromNaN/mercure-mongodb/actions/workflows/ci.yml/badge.svg)](https://github.com/GromNaN/mercure-mongodb/actions/workflows/ci.yml)
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Go 1.27](https://img.shields.io/badge/go-1.27-00ADD8)](https://go.dev/)
 
 A [MongoDB](https://www.mongodb.com/) transport for the [Mercure](https://mercure.rocks) hub.
@@ -325,6 +325,6 @@ replica set, because change streams are not available on a standalone server.
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE), the same license as Mercure. If you run a
-modified version of this software as a network service, the AGPL requires you to
-offer the corresponding source to its users.
+[MIT](LICENSE). This module is a separate work that plugs into the Mercure hub
+through its public transport interface. Mercure itself stays under
+AGPL-3.0-or-later.
