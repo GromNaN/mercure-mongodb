@@ -1,0 +1,26 @@
+# Mercure hub using MongoDB as its only shared service.
+#
+# Run with a Caddy build that includes the mercure handler and this transport:
+#   xcaddy build \
+#     --with github.com/dunglas/mercure/caddy \
+#     --with github.com/GromNaN/mercure-mongodb
+
+{
+	admin off
+}
+
+http://localhost:3000 {
+	mercure {
+		# Store updates in MongoDB and sync every hub instance through it.
+		transport mongodb {
+			uri {$MERCURE_MONGODB_URI}
+			database mercure
+			collection updates
+			# Keep the 10000 newest updates. 0 keeps everything.
+			retention 10000
+		}
+
+		publisher_jwt {$MERCURE_PUBLISHER_JWT_KEY} HS256
+		subscriber_jwt {$MERCURE_SUBSCRIBER_JWT_KEY} HS256
+	}
+}

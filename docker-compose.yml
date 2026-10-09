@@ -1,0 +1,10 @@
+# MongoDB Atlas Local for development and tests.
+#
+# It runs a single node replica set and initializes it on startup, so change
+# streams work out of the box. The image ships a healthcheck, so a client can
+# wait for `docker compose up -d --wait` before connecting.
+services:
+  mongodb:
+    image: mongodb/mongodb-atlas-local:latest
+    ports:
+      - "27017:27017"
