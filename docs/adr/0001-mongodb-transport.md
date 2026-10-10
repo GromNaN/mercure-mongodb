@@ -307,13 +307,15 @@ flushed after history, in order.
 
 ### 8. MongoDB dependency
 
-The transport requires a replica set. Change streams are not available on a
-standalone server, and a sharded cluster does not enforce the global uniqueness
-of `_id` that the gapless sequence relies on: a sharded collection enforces the
-`_id` index per shard unless `_id` is the shard key, so two shards could accept
-the same sequence number. `Provision` verifies the topology and fails with an
-actionable error on a standalone server and on a sharded cluster. Integration
-tests run against a replica set.
+The transport requires a replica set. `Provision` verifies that the deployment
+can serve change streams by opening one: a standalone server rejects the
+`$changeStream` stage, so the transport fails with an actionable error on one.
+A sharded cluster accepts the change stream, so it is not detected, but it is
+not supported: a sharded collection enforces the `_id` index per shard unless
+`_id` is the shard key, so two shards could accept the same sequence number and
+break the gapless sequence. The replica set requirement is documented for
+sharding rather than enforced at startup. Integration tests run against a
+replica set.
 
 ## Consequences
 

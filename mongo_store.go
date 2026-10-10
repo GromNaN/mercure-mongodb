@@ -93,13 +93,15 @@ func newMongoStore(ctx context.Context, cfg mongoConfig) (*mongoStore, error) {
 		watchAwait:  cfg.WatchAwaitTime,
 	}
 
-	if err := s.checkChangeStreamSupport(ctx); err != nil {
+	// Create the collections before probing the change stream, so the probe has
+	// a namespace to open on.
+	if err := s.ensureIndexes(ctx); err != nil {
 		_ = client.Disconnect(context.Background())
 
 		return nil, err
 	}
 
-	if err := s.ensureIndexes(ctx); err != nil {
+	if err := s.checkChangeStreamSupport(ctx); err != nil {
 		_ = client.Disconnect(context.Background())
 
 		return nil, err
@@ -117,31 +119,24 @@ func newMongoStore(ctx context.Context, cfg mongoConfig) (*mongoStore, error) {
 	return s, nil
 }
 
-// checkChangeStreamSupport reads the deployment topology and rejects the
-// deployments the transport cannot run on: a standalone server, which cannot
-// serve change streams, and a sharded cluster, which does not enforce the
-// global uniqueness of _id that the gapless sequence relies on.
+// checkChangeStreamSupport verifies that the deployment can serve change
+// streams by opening one and closing it. A standalone server rejects the
+// $changeStream stage, so the transport refuses to start on one. A sharded
+// cluster accepts the stream, so it is not detected here, but it is not
+// supported: the gapless sequence relies on the global uniqueness of _id,
+// which a sharded collection only enforces per shard unless _id is the shard
+// key.
 func (s *mongoStore) checkChangeStreamSupport(ctx context.Context) error {
-	var hello bson.M
-
-	err := s.client.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
+	stream, err := s.Watch(ctx, nil)
 	if err != nil {
-		// The driver runs the same handshake command on every connection, so a
-		// working connection implies this command is allowed. Failing here means
-		// the deployment or the credentials are wrong, which must stop startup
-		// rather than defer to a change stream error later.
-		return fmt.Errorf("reading the deployment topology: %w", err)
+		return fmt.Errorf("the deployment cannot serve change streams, use a replica set: %w", err)
 	}
 
-	if msg, _ := hello["msg"].(string); msg == "isdbgrid" {
-		return errSharded
+	if err := stream.Close(ctx); err != nil {
+		return err
 	}
 
-	if _, ok := hello["setName"]; ok {
-		return nil // replica set
-	}
-
-	return errStandalone
+	return nil
 }
 
 // ensureIndexes creates the secondary indexes used by the Last-Event-ID
