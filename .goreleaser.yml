@@ -61,9 +61,14 @@ archives:
       {{- if .Arm }}v{{ .Arm }}{{ end }}
     files:
       - LICENSE
-      - LICENSES
+      - COPYRIGHT
       - README.md
       - Caddyfile
+
+# One SPDX SBOM per archive, attached to the GitHub release. The cataloging step
+# shells out to syft, which the release workflow installs.
+sboms:
+  - artifacts: archive
 
 dockers_v2:
   - ids:
@@ -83,8 +88,8 @@ dockers_v2:
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.created: "{{ .Date }}"
+    # Attach an SBOM attestation to the image manifest in the registry.
+    sbom: true
     # Files the Dockerfile copies out of the build context.
     extra_files:
       - Caddyfile
-      - LICENSE
-      - LICENSES
