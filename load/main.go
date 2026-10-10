@@ -8,7 +8,7 @@
 // Example:
 //
 //	go run ./load \
-//	  -hub http://localhost:3000/hub \
+//	  -hub http://localhost:3000/.well-known/mercure \
 //	  -publish-token "$PUBLISHER_JWT" \
 //	  -subscribe-token "$SUBSCRIBER_JWT" \
 //	  -clients 2000 -messages 2000
@@ -33,7 +33,7 @@ import (
 )
 
 func main() {
-	hub := flag.String("hub", "http://localhost:3000/hub", "hub URL")
+	hub := flag.String("hub", "http://localhost:3000/.well-known/mercure", "hub URL")
 	publishToken := flag.String("publish-token", "", "publisher JWT")
 	subscribeToken := flag.String("subscribe-token", "", "subscriber JWT")
 	topic := flag.String("topic", "https://example.com/load", "topic")
@@ -167,7 +167,7 @@ func subscribe(
 	// only a safety net. It must not double count with the signal below.
 	defer done()
 
-	query := url.Values{"topic": {topic}}
+	query := url.Values{"match": {topic}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"?"+query.Encode(), nil)
 	if err != nil {
 		connectFails.Add(1)

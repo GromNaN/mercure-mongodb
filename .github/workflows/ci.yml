@@ -47,3 +47,34 @@ jobs:
 
       - name: Integration tests
         run: MONGODB_URI='mongodb://localhost:27017/?directConnection=true' go test -race -run TestIntegration -count=1 ./...
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    services:
+      # The hub needs a replica set, for change streams, and a MongoDB to talk to.
+      mongodb:
+        image: mongodb/mongodb-atlas-local:latest
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+
+      # Build the binary the same way GoReleaser does, so the smoke test
+      # exercises the tags and options that ship in the image.
+      - name: Build the hub binary
+        run: |
+          mkdir -p linux/amd64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -tags deprecated_transport,deprecated_topic,deprecated_claim,nobadger,nomysql,nopgx \
+            -o linux/amd64/mercure-mongodb ./caddy/mercure
+
+      - name: Build the image
+        run: docker build --build-arg TARGETPLATFORM=linux/amd64 -t mercure-mongodb:ci .
+
+      - name: Smoke test the image
+        run: MONGODB_URI='mongodb://localhost:27017/?directConnection=true' ./.github/scripts/smoke-test-image.sh mercure-mongodb:ci

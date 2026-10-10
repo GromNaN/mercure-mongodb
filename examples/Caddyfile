@@ -4,7 +4,6 @@
 #   xcaddy build \
 #     --with github.com/dunglas/mercure/caddy \
 #     --with github.com/GromNaN/mercure-mongodb
-
 {
 	admin off
 }
@@ -20,7 +19,16 @@ http://localhost:3000 {
 			retention 10000
 		}
 
-		publisher_jwt {$MERCURE_PUBLISHER_JWT_KEY} HS256
-		subscriber_jwt {$MERCURE_SUBSCRIBER_JWT_KEY} HS256
+		# Trusted issuer: binds the iss claim access tokens must carry (RFC 9068)
+		# to its verification keys. Add more `issuer` blocks to trust several
+		# issuers.
+		issuer http://localhost:3000 {
+			publisher {
+				jwt {env.MERCURE_PUBLISHER_JWT_KEY} HS256
+			}
+			subscriber {
+				jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} HS256
+			}
+		}
 	}
 }
