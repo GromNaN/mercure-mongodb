@@ -117,8 +117,10 @@ func newMongoStore(ctx context.Context, cfg mongoConfig) (*mongoStore, error) {
 	return s, nil
 }
 
-// checkChangeStreamSupport reads the deployment topology and rejects a
-// standalone server, which cannot serve change streams.
+// checkChangeStreamSupport reads the deployment topology and rejects the
+// deployments the transport cannot run on: a standalone server, which cannot
+// serve change streams, and a sharded cluster, which does not enforce the
+// global uniqueness of _id that the gapless sequence relies on.
 func (s *mongoStore) checkChangeStreamSupport(ctx context.Context) error {
 	var hello bson.M
 
@@ -132,7 +134,7 @@ func (s *mongoStore) checkChangeStreamSupport(ctx context.Context) error {
 	}
 
 	if msg, _ := hello["msg"].(string); msg == "isdbgrid" {
-		return nil // sharded cluster
+		return errSharded
 	}
 
 	if _, ok := hello["setName"]; ok {

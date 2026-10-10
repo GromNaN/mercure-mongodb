@@ -16,7 +16,7 @@ import (
 
 // integrationURI returns the replica set connection string. The integration
 // tests are skipped when MONGODB_URI is not set. The target must be a replica
-// set or a sharded cluster, because change streams are required.
+// set, because change streams are required.
 func integrationURI(t *testing.T) string {
 	t.Helper()
 

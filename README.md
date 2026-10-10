@@ -53,8 +53,9 @@ the full design and its trade-offs.
 
 ## Requirements
 
-- A MongoDB replica set or a sharded cluster. Change streams are not available
-  on a standalone server, so the transport refuses to start on one.
+- A MongoDB replica set. A standalone server cannot serve change streams, and a
+  sharded cluster does not enforce the global uniqueness of `_id` that the
+  gapless sequence relies on, so the transport refuses to start on both.
 - A Caddy build that includes the Mercure handler and this transport.
 
 Supported versions:
