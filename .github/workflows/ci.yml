@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -race ./...
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    services:
+      # MongoDB Atlas Local runs a single node replica set and initializes it on
+      # startup, so change streams work out of the box.
+      mongodb:
+        image: mongodb/mongodb-atlas-local:latest
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+
+      - name: Integration tests
+        run: MONGODB_URI='mongodb://localhost:27017/?directConnection=true' go test -race -run TestIntegration -count=1 ./...

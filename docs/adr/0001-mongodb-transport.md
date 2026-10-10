@@ -1,0 +1,445 @@
+# ADR 0001: MongoDB transport for the Mercure hub
+
+Status: proposed
+
+Date: 2026-10-09
+
+## Context
+
+Mercure hubs are Caddy modules. The hub core handles the Mercure protocol, the
+HTTP endpoints, JWT authorization and the SSE server. Storage and cross instance
+synchronization are delegated to a `mercure.Transport` implementation.
+
+The built in transports are `local` (memory only) and `bolt` (a single node file
+database). Neither one synchronizes several hubs. The goal is a transport that
+uses MongoDB as the only shared service: a durable update history and a fan out
+channel between hub instances, with no Redis, Kafka or other broker.
+
+Target versions: Mercure v1.1.0, Caddy v2.11.7, Go 1.27, MongoDB Go driver v2.
+
+## Transport contract (observed in Mercure v1.1.0)
+
+`mercure.Transport` (transport.go) has four methods:
+
+* `Dispatch(ctx, *Update) error`
+* `AddSubscriber(ctx, *LocalSubscriber) error`
+* `RemoveSubscriber(ctx, *LocalSubscriber) error`
+* `Close(ctx) error`
+
+An optional `TransportSubscribers` adds `GetSubscribers(ctx) (string, []*Subscriber, error)`.
+An optional `TransportHealthChecker` adds `Ready(ctx) error` and `Live(ctx) error`.
+
+Contract details that constrain the design:
+
+* `Dispatch` takes ownership of the update and may set its ID with `AssignUUID`.
+  A custom `Last-Event-ID` set by the publisher must be kept as is.
+* `AddSubscriber` must call `s.HistoryDispatched(id)` exactly once when
+  `s.RequestLastEventIDSet` is true, even for an empty requested ID. The
+  subscribe handler blocks on this call before writing the response headers.
+* History events are sent with `s.Dispatch(ctx, update, true)`, live events with
+  `s.Dispatch(ctx, update, false)`. A subscriber that is not yet `Ready` buffers
+  live events in an internal queue, so the transport can replay history first and
+  then call `s.Ready(ctx)` to flush live events in order.
+* `SubscriberList.MatchAny` and `Subscriber.Match` do topic and private topic
+  authorization. The transport must use them, never its own matcher.
+
+## Decisions
+
+### 1. Append only event document
+
+Each update is one immutable document in an events collection:
+
+```
+{
+  _id:            int64,   // internal cursor, gapless and monotonic
+  mercure_id:     string,  // visible Mercure update ID (custom or urn:uuid:...)
+  topics:         [string],
+  private:        bool,
+  data:           string,
+  type:           string,  // optional
+  retry:          int64,   // optional
+  debug:          bool,
+  created_at:     date,
+  schema_version: int32
+}
+```
+
+The visible Mercure ID (`mercure_id`) is separate from the internal cursor
+(`_id`). A publisher may send its own ID, so the visible ID is not unique and
+not ordered. The cursor is always server assigned.
+
+Documents are never updated. Retention deletes whole documents. The schema
+version allows a future migration.
+
+### 2. Write ordering
+
+The cursor `_id` is a gapless sequence assigned at insert time. It is the total
+order for replay and for the replay/live boundary.
+
+The sequence is assigned optimistically: read the current maximum `_id`, try to
+insert with `max + 1`, and on a duplicate key error read the maximum again and
+retry. A unique index on `_id` (the default) enforces this. Two properties hold:
+
+* The committed set of `_id` values is always contiguous (`1..M`). An insert of
+  `k` only succeeds when `k - 1` already exists, because the candidate is always
+  `observedMax + 1` and `observedMax` never exceeds the committed maximum.
+* Because the set is contiguous, commit order equals `_id` order.
+
+The contiguity argument needs two reads to observe the latest committed state,
+so the transport reads from the primary and writes with `w:majority`. A
+secondary read could return a stale maximum and an acknowledgement from a rolled
+back write would break the proof.
+
+What order does the transport need? It does not need a causal order: two
+simultaneous publishes have no true order, and Mercure does not require one. It
+needs a single total order that every hub agrees on, so that the live path (the
+change stream order) and the replay path (an `_id` range) observe the same
+sequence. The optimistic sequence gives that, and it also makes the order equal
+to the commit order, which is what the replay/live boundary relies on.
+
+An ObjectId does not give this property. It is 12 bytes: a 4 byte timestamp in
+seconds (big endian), a 5 byte per process random value, and a 3 byte counter.
+Because the timestamp is the leading field and the comparison is byte wise,
+ObjectIds created in different seconds sort by time across servers, but they
+only have one second of temporal resolution, so ObjectIds created within the
+same second have no guaranteed ordering. The relative order within a second is
+influenced by the random per process value, which is regenerated when a process
+restarts. An ObjectId is therefore only approximately ordered by creation time,
+it is not gapless, and it is not aligned with the commit order. A wall clock
+timestamp is not monotonic with the commit order either. Neither one is used as
+the order.
+
+Cost: concurrent publishers on the same collection collide on the candidate and
+retry. Under a single hub the transport serializes local candidate allocation
+with a mutex, so local publishes do not collide with each other. Across hubs,
+collisions are resolved by the unique index and a bounded retry with backoff.
+Publish throughput is therefore bounded by insert latency times the retry rate,
+not by fan out. Fan out happens outside the allocation lock (see decision 6).
+Under cross hub contention the retry rate grows with the number of concurrent
+publishers, so this transport favors correctness over raw publish throughput.
+
+### 3. Replay and retention
+
+Indexes:
+
+* `_id` (default, unique): cursor order, range replay, retention.
+* `{mercure_id: 1, _id: 1}`: resolve a requested `Last-Event-ID` to its earliest
+  occurrence in one ordered lookup.
+
+Retention is count based only (`retention`, the number of newest events kept).
+The default is 0, meaning unlimited, matching the Bolt transport default of
+`size = 0`. A cleanup job runs on a timer and deletes the events older than the
+newest `retention` events.
+
+There is no age based retention. A TTL index would delete the newest document
+when it is also the oldest, which could make the sequence restart at 1. A
+restart would break the replay/live boundary and the watermark. Retention is
+therefore always `DELETE WHERE _id < boundary` with the newest document kept.
+
+When the events collection is dropped or renamed while a hub is running, the
+change stream sends an `invalidate` event. The hub logs an error and resets its
+watermark, because the sequence restarted at 1. Dropping the collection is a
+destructive operator action: history is lost by design.
+
+A requested `Last-Event-ID` that resolves to no document (never seen, or deleted
+by retention) makes the transport answer `earliest`. This tells the client to
+reload its state and reconnect, which is the documented behavior of the Bolt
+transport. The advertised contract matches the data that is actually kept: if
+the operator sets a small retention, reconnects beyond that window get `earliest`.
+
+A requested `Last-Event-ID` that resolves to a document resolves to the earliest
+occurrence of that ID still in the retention window. When that occurrence is not
+the first occurrence of the ID, an earlier one was removed by retention and the
+client position is ambiguous: replaying from the retained occurrence would skip
+the events between the two, so the transport answers `earliest` instead. This
+happens on a publisher retry after an ambiguous write error, which stores the
+same update twice under two sequences and one visible ID.
+
+To detect it, the `seen_ids` collection records every visible Mercure ID and the
+time of its most recent occurrence, and each event document carries a `First`
+flag set at append time. The collection is bounded to the retention window:
+`Cleanup` drops a marker once the ID has no occurrence left in the window, so a
+reuse after the ID left the window is treated as a new ID. A client that saw the
+earlier occurrence can then be replayed a suffix that skips updates. This is the
+accepted trade-off for a bounded collection. Within the window the marker is
+exact.
+
+### 4. Change streams and checkpoints
+
+Each hub opens one change stream on the events collection. The stream is not
+filtered by operation type, because the consumer must also see `invalidate`
+events (decision 3) and skip retention `delete` events. Insert events carry the
+full document.
+
+The hub persists a checkpoint `{resume_token, seq, updated_at}` in a checkpoints
+collection, keyed by the hub name (the Caddy `name` directive, `default` when
+unset). This keeps two differently named hubs on the same collection isolated.
+The checkpoint is written on a timer (`checkpoint_interval`, default 1s) and on
+close, not on every event, to bound write load.
+
+On startup the hub resumes the change stream with `resumeAfter` when a token
+exists. When the token is no longer in the oplog, MongoDB returns a change
+stream history lost error. The hub then catches up from the durable collection:
+it reads the current maximum `_id`, delivers every event in
+`(appliedWatermark, max]` to the connected subscribers, and opens a fresh change
+stream from the current time. Connected subscribers do not lose the events
+published during the interruption, because the catch up delivers them.
+
+Whenever the hub opens a stream without a resume token, it opens the stream
+first and then catches up. The stream captures events committed from that point
+on, and the catch up fills the range that predates the stream. The order matters:
+a catch up that ran before the stream opened could miss an event committed in
+between, and one that ran concurrently with stream delivery could let a high
+sequence overtake a low one. Opening first, then catching up sequentially,
+leaves no such window. Overlap at the boundary is dropped by the watermark.
+
+The consumer also detects gaps without a stream error. Because the sequence is
+gapless, an insert whose `seq` is above `appliedWatermark + 1` means the hub
+missed events. The consumer reads the missing range from the durable collection
+and delivers it in order before the event that revealed the gap. This makes
+delivery robust to a resume that silently skipped documents.
+
+A gap that the durable collection can no longer fill is handled explicitly. When
+retention removed events a lagging hub still needs, the missing range is gone for
+good. Retrying would loop, so the consumer disconnects every subscriber and fast
+forwards the watermark past the hole. Each client reconnects with its
+`Last-Event-ID` and replays from the durable collection, or is answered
+`earliest` when its position was removed. The transport never advances the
+watermark past a gap it could not fill, and it never delivers the event that
+revealed the gap before the range is complete. A catch up that fails for a
+transient reason is retried, and the hub does not report itself ready until the
+catch up succeeded.
+
+The hub exposes `Lag(ctx)`, the number of committed events it has not applied
+yet, so an operator can see a lagging instance.
+
+### 5. Guarantees after a crash
+
+Delivery to SSE clients is best effort with at least once semantics, never
+exactly once. Subscribers live in hub memory and are lost on a crash, so a crash
+cannot duplicate a delivery to a live client. After a restart the hub replays
+from a checkpoint, or from the durable maximum when the token expired. Because
+the change stream is read with a single consumer and an applied watermark
+(`appliedWatermark`), a resumed stream cannot dispatch the same event twice to
+the same subscriber: an event with `seq <= appliedWatermark` is dropped.
+
+A publisher retry after an ambiguous write error can store the same update twice,
+under two sequences and one visible ID. This is the source of the end to end at
+least once behavior, and it is why a repeated ID replays from its earliest
+occurrence (decision 3).
+
+The checkpoint is written periodically, so a crash loses at most
+`checkpoint_interval` of checkpoints. On resume the hub replays the durable
+events after the checkpoint to rebuild its watermark. These events are not sent
+to any client, because there are no clients yet at startup. The only observable
+effect is a bounded startup catch up.
+
+No exactly once claim is made. The README states the at least once model and the
+`Last-Event-ID` reconnect contract.
+
+### 6. Multi instance behavior and the local/change stream duplicate
+
+Every hub keeps its own SSE connections and subscriptions in memory. All hubs
+consume the same change stream, so a publish on hub A reaches a subscriber on
+hub B through MongoDB.
+
+All delivery, including delivery on the publishing hub, goes through the change
+stream. The publishing hub does not broadcast to its local subscribers inside
+`Dispatch`. This removes the local publish / change stream duplicate by
+construction: there is a single ordered delivery path, so an update is never
+delivered twice and never out of order. It also decouples publish throughput
+from fan out, because the fan out runs in the change stream consumer and not in
+the publish path.
+
+Trade off: delivery latency includes the change stream latency (typically a few
+milliseconds), and delivery requires a healthy change stream. The transport
+implements `TransportHealthChecker` so a hub can report not ready when the stream
+is down, and it reconnects with exponential backoff. The README documents this.
+
+`GetSubscribers` reports only the subscribers connected to this hub instance,
+because the subscriber list is local. This matches the Bolt transport.
+
+**Writer concentration.** The sequence is a single logical counter, so allocation
+is a serialization point by construction. Adding writer hubs does not
+parallelize it, it only adds collisions. A single writer hub has no collisions
+and the shortest publish path. Spreading publishes across hubs is still correct,
+because the unique index resolves every collision, but each collision costs an
+extra primary read and an extra insert attempt, and a synchronized burst of
+writers is the worst case.
+
+Concentrating the writes on one elected hub is therefore the efficient
+deployment, but it trades write availability for write throughput. The writer
+becomes a single point of failure for publishing, so it must be elected or
+failed over. Delivery, replay and subscriptions are unaffected, because they run
+on the change stream on every hub and not on the writer. The writer is only a
+sequence allocator, it holds no ordering state, so a failover is safe: if two
+hubs publish during the handover, the collisions are absorbed, not corrupted.
+
+Avoid placing writers in different regions. The collision window grows with the
+insert latency, so each collision costs an inter-region round trip, and one
+writer per region does not help because the sequence head is still unique.
+
+### 7. Replay/live coherence
+
+`AddSubscriber` runs as follows:
+
+1. Resolve the requested `Last-Event-ID` to the highest sequence the client
+   already has, outside the lock, because it needs a database lookup.
+2. Take a snapshot `bound` of the applied watermark and register the subscriber
+   in the same critical section, shared with the consumer. This makes the
+   snapshot and the registration atomic: no event can be delivered between them.
+3. Set the subscriber live floor to `max(bound, resolvedSeq)`. The floor covers
+   both the replay snapshot and the position the client already reached. A hub
+   that lags behind the client (its `bound` is below `resolvedSeq`) must not
+   redeliver events the client already has, so the floor is the maximum.
+4. If `RequestLastEventIDSet`, replay the durable range `(resolvedSeq, bound]`
+   in order and dispatch matching events as history. When the requested ID is
+   unknown, answer `earliest` without replay.
+5. Call `s.Ready(ctx)` to flush buffered live events.
+
+The change stream consumer dispatches a live event to a subscriber only when
+`seq > liveFloor`. Events with `seq <= bound` belong to history and are replayed.
+Because the committed set is contiguous, there is no event with `seq <= bound`
+that is not already in the collection, so there is no gap. Because replay stops
+at `bound` and live delivery starts above the floor, there is no duplicate.
+During replay the subscriber is not ready, so any live event is buffered and
+flushed after history, in order.
+
+### 8. MongoDB dependency
+
+The transport requires a replica set. Change streams are not available on a
+standalone server, and a sharded cluster does not enforce the global uniqueness
+of `_id` that the gapless sequence relies on: a sharded collection enforces the
+`_id` index per shard unless `_id` is the shard key, so two shards could accept
+the same sequence number. `Provision` verifies the topology and fails with an
+actionable error on a standalone server and on a sharded cluster. Integration
+tests run against a replica set.
+
+## Consequences
+
+* A durable, ordered history with an exact, tested reconnect contract.
+* Multi instance synchronization with one shared MongoDB deployment and no extra
+  broker.
+* Publish throughput is bounded by the optimistic sequence under cross hub
+  contention. This favors correctness over throughput and is documented.
+* Delivery depends on the change stream. The transport surfaces its health and
+  its lag.
+
+## Alternatives considered and rejected
+
+This section records the options that were evaluated for the two hard problems:
+a deterministic order, and retention.
+
+### Ordering
+
+**ObjectId.** Rejected in decision 2. It is sortable across servers, but only
+approximately by time, and it is not gapless and not aligned with the commit
+order.
+
+**Wall clock timestamp.** Not monotonic with the commit order, and subject to
+clock skew between servers. Rejected in decision 2.
+
+**Natural order (`$natural`, `recordId`).** Natural order is the order in which
+WiredTiger record ids are created and stored. It is the default order of a
+collection scan on a single node, but the official documentation states that in
+a replica set natural order is not guaranteed to be consistent and can differ
+between members, and that in a sharded collection natural order is not defined.
+A natural order scan yields a consistent result set only when the whole read
+runs on one replica set node, which is a constraint of the scan and not a
+general read consistency guarantee, so it cannot be resumed on another node, and
+mongos does not support `$_requestResumeToken` for natural order reads. The
+MongoDB 8.0 release notes list `SERVER-82180`, where capped inserts have a
+different natural ordering on the primary than on the secondaries. A per node
+storage order cannot be a cursor shared by every hub, so natural order is
+rejected.
+
+**Oplog order and `clusterTime`.** Within a single replica set, writes have a
+total order defined by the oplog and its monotonically increasing optimes. In a
+sharded cluster each shard has its own oplog and its own optime sequence, and
+mongos merges the shards deterministically into one ordered stream. Change
+streams deliver events in that order, and this is what the live path already
+follows. Each change event carries a `clusterTime`, a logical clock synchronized
+across the deployment, but it is not a usable unique replay cursor. `clusterTime`
+values are not guaranteed to be unique across shards, so two events can share
+one, and starting in MongoDB 8.0 a bulk insert outside a transaction can be
+written as a single oplog entry, so every document in the batch shares one
+`clusterTime`. A `clusterTime` is also not stored on the document, so it cannot
+be a range key for replay without an extra write. To get a strict application
+level order, the recommended approach is an application level sequence field,
+which is what this transport uses. Transactions give a group of writes one
+commit order, but they order only the writes inside a transaction, not
+independent concurrent writes, so `lsid` and `txnNumber` are not a general
+ordering mechanism.
+
+**Counter collection with `$inc`.** A separate counters collection with one
+document per sequence, updated with `findAndModify` and `$inc`, returns a unique
+increasing value. This is the documented auto incrementing sequence pattern, and
+it removes the duplicate key retry of decision 2. It is rejected for three
+reasons. The counter document is a single global hot document, so every publish
+on every hub serializes on it. The value is allocated before the insert commits,
+so a failed insert consumes a number and leaves a permanent hole, which the
+replay contiguity check cannot distinguish from a retention delete; keeping the
+sequence gapless would require wrapping the allocation and the insert in one
+transaction, which reintroduces `WriteConflict` retries on the counter document.
+Finally, because two allocations are independent, a hub can allocate a low
+number and commit it after another hub committed a higher one, so `_id` order no
+longer equals commit order, and the live path and the replay path can disagree.
+The objection that rejects the ObjectId applies again.
+
+**`$merge` in an aggregation.** Reading the current maximum with `$sort` and
+`$limit` and writing the new document with `$merge` in one pipeline does not make
+the read and the write atomic: two pipelines can observe the same maximum and
+both try to merge `max + 1`, unless the pipeline adds its own concurrency
+control. In this design that means it still needs the duplicate key retry, it
+needs a special case for an empty collection, and it loses the local index hint
+used to read the maximum. These are design specific concerns, not universal
+properties of `$merge`, and they make the pipeline more complex for the same
+guarantees as decision 2.
+
+**Collection level write lock.** MongoDB has no user facing collection write
+lock. WiredTiger uses document level concurrency control, optimistic concurrency
+for most read and write operations, and intent locks at the global, database and
+collection levels, so multiple clients can modify different documents of a
+collection at the same time. The ways to serialize writers are a unique index
+plus a retry (this design), a transaction that aborts with `WriteConflict` and
+retries, or a distributed lock outside the database. `db.fsyncLock()` exists but
+is a server wide administrative command for backups, not a per collection lock.
+There is no lock mode to lean on, so this design relies on the unique index on
+`_id`, which rejects all but one of the concurrent candidates for a given
+sequence number, to make the optimistic allocation safe.
+
+**Replicated record ids (future).** Internal server work would expose the
+storage `recordId` in change stream events for collections created with
+`recordIdsReplicated: true`, with range filtering and resuming by record id, and
+a monotonic guarantee per replica set. The driver change stream decision
+(`DRIVERS-2654`) has punted it, and the server work (`SPM-2983`) is still in
+development, so this is not a stable, generally available consumer contract for
+the target server version. If it ships and is documented, it could replace the
+application sequence. It is the only native primitive that could.
+
+**Local immediate broadcast plus change stream.** Reintroduces the duplicate and
+the cross source ordering problem (see decision 6).
+
+### Retention and storage
+
+**Capped collection.** A capped collection is a fixed size collection that
+inserts and retrieves documents in insertion order, and makes room for new
+documents by deleting the oldest ones, like a circular buffer. It would remove
+the cleanup job, so it was considered. It is rejected for this transport.
+Retention would be size based in bytes (the document count cap is secondary and
+the size limit takes precedence), while Mercure retention is a count, so the
+`retention` option could not keep its meaning. Documents cannot be deleted
+individually, so `Cleanup` and manual purge disappear. The collection cannot be
+sharded, which blocks horizontal scale. It serializes write operations and has
+worse concurrent insert performance than a regular collection, and MongoDB does
+not guarantee insertion order when there are concurrent writers, so the eviction
+boundary is not a reliable prefix of the sequence. Resizing is possible with
+`collMod` since MongoDB 6.0, so it is not inherently a maintenance operation, but
+the other limits remain. It does not remove the sequence problem either, the
+write path is unchanged.
+
+**TTL index.** Rejected in decision 3. A TTL index removes documents by their
+expiration date, not by their sequence number. If the document that holds the
+current maximum is also the oldest by its TTL date, it can be removed, and an
+allocator that derives the next value from the remaining maximum could then
+reuse or restart a number. This is why retention is count based.

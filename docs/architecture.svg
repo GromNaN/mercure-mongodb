@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="530" viewBox="0 0 1020 530" role="img" aria-labelledby="title desc">
+  <title id="title">Mercure MongoDB transport architecture</title>
+  <desc id="desc">A publisher posts to any Mercure hub, here Mercure Hub A or Mercure Hub B. Each hub inserts one event document into a MongoDB replica set. Every hub reads the same collection through a change stream, so an update published on any hub reaches every subscriber on every hub. Each hub serves many subscribers over SSE.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#5F6368"/>
+    </marker>
+    <marker id="arrow-stream" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#1A73E8"/>
+    </marker>
+    <style>
+      .node-title { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 16px; font-weight: 600; fill: #202124; }
+      .node-sub { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #5F6368; }
+      .group-title { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 13px; font-weight: 600; fill: #3C4043; }
+      .client-label { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #5F6368; }
+      .ellipsis { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 18px; fill: #80868B; }
+      .edge-label { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #5F6368; }
+      .edge-label-stream { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 12px; fill: #1A73E8; }
+      .note { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 13px; fill: #202124; }
+      .edge { fill: none; stroke: #5F6368; stroke-width: 1.6; }
+      .edge-stream { fill: none; stroke: #1A73E8; stroke-width: 1.6; stroke-dasharray: 6 4; }
+      .label-bg { fill: #FFFFFF; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1020" height="530" fill="#FFFFFF"/>
+
+  <!-- Publisher -->
+  <rect x="410" y="24" width="200" height="56" rx="10" fill="#E8F0FE" stroke="#1A73E8" stroke-width="1.6"/>
+  <text class="node-title" x="510" y="58" text-anchor="middle">Publisher</text>
+
+  <!-- Hub A -->
+  <rect x="220" y="170" width="240" height="84" rx="10" fill="#FEF7E0" stroke="#F9AB00" stroke-width="1.6"/>
+  <text class="node-title" x="340" y="204" text-anchor="middle">Mercure Hub A</text>
+  <text class="node-sub" x="340" y="224" text-anchor="middle">Mercure handler</text>
+  <text class="node-sub" x="340" y="242" text-anchor="middle">mongodb transport</text>
+
+  <!-- Hub B -->
+  <rect x="580" y="170" width="240" height="84" rx="10" fill="#FEF7E0" stroke="#F9AB00" stroke-width="1.6"/>
+  <text class="node-title" x="700" y="204" text-anchor="middle">Mercure Hub B</text>
+  <text class="node-sub" x="700" y="224" text-anchor="middle">Mercure handler</text>
+  <text class="node-sub" x="700" y="242" text-anchor="middle">mongodb transport</text>
+
+  <!-- MongoDB -->
+  <rect x="360" y="370" width="300" height="84" rx="10" fill="#E6F4EA" stroke="#137333" stroke-width="1.6"/>
+  <text class="node-title" x="510" y="404" text-anchor="middle">MongoDB replica set</text>
+  <text class="node-sub" x="510" y="426" text-anchor="middle">updates + checkpoints</text>
+
+  <!-- Subscribers group, Hub A -->
+  <rect x="10" y="150" width="170" height="200" rx="14" fill="#F8F9FA" stroke="#BDC1C6" stroke-width="1.4"/>
+  <text class="group-title" x="95" y="175" text-anchor="middle">Subscribers</text>
+  <rect x="30" y="190" width="130" height="36" rx="7" fill="#FFFFFF" stroke="#9AA0A6" stroke-width="1.2"/>
+  <text class="client-label" x="95" y="213" text-anchor="middle">SSE client</text>
+  <rect x="30" y="236" width="130" height="36" rx="7" fill="#FFFFFF" stroke="#9AA0A6" stroke-width="1.2"/>
+  <text class="client-label" x="95" y="259" text-anchor="middle">SSE client</text>
+  <rect x="30" y="282" width="130" height="36" rx="7" fill="#FFFFFF" stroke="#9AA0A6" stroke-width="1.2"/>
+  <text class="client-label" x="95" y="305" text-anchor="middle">SSE client</text>
+  <text class="ellipsis" x="95" y="340" text-anchor="middle">&#8230;</text>
+
+  <!-- Subscribers group, Hub B -->
+  <rect x="840" y="150" width="170" height="200" rx="14" fill="#F8F9FA" stroke="#BDC1C6" stroke-width="1.4"/>
+  <text class="group-title" x="925" y="175" text-anchor="middle">Subscribers</text>
+  <rect x="860" y="190" width="130" height="36" rx="7" fill="#FFFFFF" stroke="#9AA0A6" stroke-width="1.2"/>
+  <text class="client-label" x="925" y="213" text-anchor="middle">SSE client</text>
+  <rect x="860" y="236" width="130" height="36" rx="7" fill="#FFFFFF" stroke="#9AA0A6" stroke-width="1.2"/>
+  <text class="client-label" x="925" y="259" text-anchor="middle">SSE client</text>
+  <rect x="860" y="282" width="130" height="36" rx="7" fill="#FFFFFF" stroke="#9AA0A6" stroke-width="1.2"/>
+  <text class="client-label" x="925" y="305" text-anchor="middle">SSE client</text>
+  <text class="ellipsis" x="925" y="340" text-anchor="middle">&#8230;</text>
+
+  <!-- Publisher -> Hub A -->
+  <path class="edge" d="M480,80 L480,120 L340,120 L340,170" marker-end="url(#arrow)"/>
+  <rect class="label-bg" x="379" y="96" width="62" height="17" rx="4"/>
+  <text class="edge-label" x="410" y="109" text-anchor="middle">POST /hub</text>
+
+  <!-- Publisher -> Hub B -->
+  <path class="edge" d="M540,80 L540,120 L700,120 L700,170" marker-end="url(#arrow)"/>
+  <rect class="label-bg" x="589" y="96" width="62" height="17" rx="4"/>
+  <text class="edge-label" x="620" y="109" text-anchor="middle">POST /hub</text>
+
+  <!-- Hub A -> MongoDB (insert) -->
+  <path class="edge" d="M340,254 L340,310 L450,310 L450,370" marker-end="url(#arrow)"/>
+  <rect class="label-bg" x="337" y="290" width="116" height="17" rx="4"/>
+  <text class="edge-label" x="395" y="303" text-anchor="middle">insert one event</text>
+
+  <!-- Hub B -> MongoDB (insert) -->
+  <path class="edge" d="M700,254 L700,310 L590,310 L590,370" marker-end="url(#arrow)"/>
+  <rect class="label-bg" x="587" y="290" width="116" height="17" rx="4"/>
+  <text class="edge-label" x="645" y="303" text-anchor="middle">insert one event</text>
+
+  <!-- MongoDB -> Hub A (change stream) -->
+  <path class="edge-stream" d="M360,412 L260,412 L260,254" marker-end="url(#arrow-stream)"/>
+  <rect class="label-bg" x="258" y="417" width="100" height="17" rx="4"/>
+  <text class="edge-label-stream" x="308" y="430" text-anchor="middle">change stream</text>
+
+  <!-- MongoDB -> Hub B (change stream) -->
+  <path class="edge-stream" d="M660,412 L760,412 L760,254" marker-end="url(#arrow-stream)"/>
+  <rect class="label-bg" x="660" y="417" width="100" height="17" rx="4"/>
+  <text class="edge-label-stream" x="710" y="430" text-anchor="middle">change stream</text>
+
+  <!-- Hub A -> Subscribers (SSE) -->
+  <path class="edge" d="M220,212 L180,212" marker-end="url(#arrow)"/>
+  <rect class="label-bg" x="185" y="184" width="30" height="17" rx="4"/>
+  <text class="edge-label" x="200" y="197" text-anchor="middle">SSE</text>
+
+  <!-- Hub B -> Subscribers (SSE) -->
+  <path class="edge" d="M820,212 L840,212" marker-end="url(#arrow)"/>
+  <rect class="label-bg" x="815" y="184" width="30" height="17" rx="4"/>
+  <text class="edge-label" x="830" y="197" text-anchor="middle">SSE</text>
+
+  <!-- Note -->
+  <text class="note" x="510" y="500" text-anchor="middle">An update published on any hub is delivered to every subscriber on every hub.</text>
+</svg>
