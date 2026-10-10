@@ -1,7 +1,7 @@
 # mercure-mongodb
 
 [![CI](https://github.com/GromNaN/mercure-mongodb/actions/workflows/ci.yml/badge.svg)](https://github.com/GromNaN/mercure-mongodb/actions/workflows/ci.yml)
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![License: AGPL 3.0](https://img.shields.io/badge/license-AGPL_3.0-blue)](LICENSE)
 [![Go 1.27](https://img.shields.io/badge/go-1.27-00ADD8)](https://go.dev/)
 
 A [MongoDB](https://www.mongodb.com/) transport for the [Mercure](https://mercure.rocks) hub.
@@ -398,15 +398,15 @@ replica set, because change streams are not available on a standalone server.
 
 ## License
 
-This project is under the [AGPL-3.0-or-later license](LICENSE).
+This project is under the [AGPL 3.0 license](LICENSE).
 
 The image and the release archives bundle three works:
 
-| Work            | License           | License file                                                          |
-| --------------- | ----------------- | --------------------------------------------------------------------- |
-| mercure-mongodb | AGPL-3.0-or-later | [`LICENSE`](LICENSE)                                                  |
-| Mercure hub     | AGPL-3.0-or-later | [`LICENSE`](https://github.com/dunglas/mercure/blob/main/LICENSE)     |
-| Caddy           | Apache-2.0        | [`LICENSE`](https://github.com/caddyserver/caddy/blob/master/LICENSE) |
+| Work            | License    | License file                                                          |
+| --------------- | ---------- | --------------------------------------------------------------------- |
+| mercure-mongodb | AGPL 3.0   | [`LICENSE`](LICENSE)                                                  |
+| Mercure hub     | AGPL 3.0   | [`LICENSE`](https://github.com/dunglas/mercure/blob/main/LICENSE)     |
+| Caddy           | Apache-2.0 | [`LICENSE`](https://github.com/caddyserver/caddy/blob/master/LICENSE) |
 
 The hub serves users over a network, so the AGPL network clause applies: if you
 run a modified version, you must offer its source to the users it serves.

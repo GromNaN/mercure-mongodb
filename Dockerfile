@@ -9,8 +9,9 @@ LABEL org.opencontainers.image.url="https://github.com/GromNaN/mercure-mongodb"
 LABEL org.opencontainers.image.documentation="https://github.com/GromNaN/mercure-mongodb#readme"
 LABEL org.opencontainers.image.source="https://github.com/GromNaN/mercure-mongodb"
 # The image bundles three works under two licenses: this transport and the
-# Mercure hub are AGPL-3.0-or-later, Caddy is Apache-2.0.
-LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later AND Apache-2.0"
+# Mercure hub are AGPL 3.0, Caddy is Apache-2.0. The label is an SPDX
+# expression, so it uses the SPDX identifier.
+LABEL org.opencontainers.image.licenses="AGPL-3.0 AND Apache-2.0"
 
 # The hub binary is built by GoReleaser for each target platform and copied into
 # the build context under ${TARGETPLATFORM}.
