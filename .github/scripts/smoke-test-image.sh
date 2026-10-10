@@ -7,14 +7,19 @@
 # published on the same topic must reach it through MongoDB.
 #
 # It targets a Linux host: the container runs with host networking, so the hub
-# reaches a MongoDB replica set on localhost:27017 and the test reaches the hub
-# on localhost:3000. This is how the CI docker job runs it.
+# reaches the MongoDB replica set on localhost and the test reaches the hub on
+# localhost:3000. This is how the CI docker job runs it.
+#
+# Environment:
+#   MONGODB_URI  MongoDB connection string, on a replica set.
+#                Defaults to mongodb://localhost:27017/?directConnection=true.
 #
 # Usage: .github/scripts/smoke-test-image.sh [image]
 #
 set -eu
 
 image="${1:-mercure-mongodb:ci}"
+mongodb_uri="${MONGODB_URI:-mongodb://localhost:27017/?directConnection=true}"
 
 container=hub
 port=3000
@@ -37,7 +42,7 @@ echo "starting the hub from ${image}"
 docker run -d --name "$container" --network host \
 	-e SERVER_NAME=":${port}" \
 	-e MERCURE_TRUSTED_ISSUERS="$issuer" \
-	-e MERCURE_MONGODB_URI='mongodb://localhost:27017/?directConnection=true' \
+	-e MERCURE_MONGODB_URI="$mongodb_uri" \
 	-e MERCURE_PUBLISHER_JWT_KEY="$key" \
 	-e MERCURE_SUBSCRIBER_JWT_KEY="$key" \
 	"$image"

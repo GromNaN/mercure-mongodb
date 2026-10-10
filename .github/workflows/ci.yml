@@ -77,4 +77,4 @@ jobs:
         run: docker build --build-arg TARGETPLATFORM=linux/amd64 -t mercure-mongodb:ci .
 
       - name: Smoke test the image
-        run: ./.github/scripts/smoke-test-image.sh mercure-mongodb:ci
+        run: MONGODB_URI='mongodb://localhost:27017/?directConnection=true' ./.github/scripts/smoke-test-image.sh mercure-mongodb:ci
