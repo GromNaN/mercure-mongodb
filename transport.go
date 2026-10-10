@@ -832,13 +832,31 @@ func (t *MongoDBTransport) recoverGap() error {
 	return nil
 }
 
-// reset restarts the watermark after the events collection was dropped.
+// reset restarts the watermark after the events collection was dropped. The
+// sequence restarted at 1, so every cached position is invalid: the store
+// discards its cached sequence, the subscribers are disconnected to force a
+// replay, and the watermark goes back to zero.
 func (t *MongoDBTransport) reset() {
+	t.store.ResetSequence()
+
+	var subscribers []*mercure.LocalSubscriber
+
 	t.mu.Lock()
 	t.committed = 0
 	t.lastToken = nil
 	t.lastEventID = mercure.EarliestLastEventID
+	t.liveFloors = make(map[*mercure.LocalSubscriber]int64)
+
+	t.subscribers.Walk(0, func(s *mercure.LocalSubscriber) bool {
+		subscribers = append(subscribers, s)
+
+		return true
+	})
 	t.mu.Unlock()
+
+	for _, s := range subscribers {
+		s.Disconnect()
+	}
 }
 
 // loadResumeToken returns the stored resume token, or nil when none exists.

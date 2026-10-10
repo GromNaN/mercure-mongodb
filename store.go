@@ -62,6 +62,10 @@ type store interface {
 	// everything.
 	Cleanup(ctx context.Context, retention int64) error
 
+	// ResetSequence discards the cached sequence after the events collection was
+	// dropped or renamed, so the next Append starts from the empty collection.
+	ResetSequence()
+
 	// Watch opens the change stream. A non nil resumeToken resumes after it.
 	Watch(ctx context.Context, resumeToken []byte) (eventStream, error)
 
@@ -113,16 +117,18 @@ type memoryStore struct {
 	watchers  map[int]chan watchedEvent
 	nextWatch int
 	maxSeq    int64
-	// seen records every visible Mercure ID ever appended. It is not subject to
-	// Cleanup, so a repeated ID is never mistaken for a first occurrence.
-	seen   map[string]struct{}
+	// seen maps every visible Mercure ID that still has an occurrence in the
+	// retention window to the sequence of its most recent occurrence. Cleanup
+	// drops the entries whose last occurrence left the window, so the map stays
+	// bounded while a repeated ID is never mistaken for a first occurrence.
+	seen   map[string]int64
 	closed bool
 }
 
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
 		watchers: make(map[int]chan watchedEvent),
-		seen:     make(map[string]struct{}),
+		seen:     make(map[string]int64),
 	}
 }
 
@@ -142,12 +148,13 @@ func (s *memoryStore) Append(_ context.Context, doc *eventDoc) error {
 
 	stored := *doc
 
-	// First is true when the visible ID was never appended before. The marker
-	// survives Cleanup, matching the MongoDB store, which keeps it in a separate
-	// collection outside retention.
+	// First is true when the visible ID has no occurrence in the retention
+	// window yet. The marker records the most recent occurrence, so Cleanup can
+	// drop it once the ID leaves the window.
 	_, alreadySeen := s.seen[doc.MercureID]
 	stored.First = !alreadySeen
-	s.seen[doc.MercureID] = struct{}{}
+	doc.First = stored.First
+	s.seen[doc.MercureID] = seq
 
 	s.docs = append(s.docs, &stored)
 
@@ -231,7 +238,24 @@ func (s *memoryStore) Cleanup(_ context.Context, retention int64) error {
 	drop := int64(len(s.docs)) - retention
 	s.docs = s.docs[drop:]
 
+	// Drop the markers whose last occurrence left the window, so the map stays
+	// bounded by the retention window.
+	boundary := s.docs[0].Seq
+	for id, last := range s.seen {
+		if last < boundary {
+			delete(s.seen, id)
+		}
+	}
+
 	return nil
+}
+
+func (s *memoryStore) ResetSequence() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.docs = nil
+	s.maxSeq = 0
 }
 
 func (s *memoryStore) Watch(_ context.Context, _ []byte) (eventStream, error) {

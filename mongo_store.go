@@ -147,7 +147,8 @@ func (s *mongoStore) checkChangeStreamSupport(ctx context.Context) error {
 // ensureIndexes creates the secondary indexes used by the Last-Event-ID
 // lookup. The compound index resolves a repeated Mercure ID to its earliest
 // occurrence in one ordered lookup. The _id index exists by default and serves
-// the cursor order, replay ranges and retention.
+// the cursor order, replay ranges and retention. The seen collection gets an
+// index on last_at, so retention can drop the markers that left the window.
 //
 // Creating an index also creates the collection when it does not exist yet, so
 // the change stream always has a namespace to watch.
@@ -157,6 +158,13 @@ func (s *mongoStore) ensureIndexes(ctx context.Context) error {
 		Options: options.Index().SetName("mercure_id_1__id_1"),
 	}); err != nil {
 		return fmt.Errorf("creating mercure_id index: %w", err)
+	}
+
+	if _, err := s.seen.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "last_at", Value: 1}},
+		Options: options.Index().SetName("last_at_1"),
+	}); err != nil {
+		return fmt.Errorf("creating seen index: %w", err)
 	}
 
 	return nil
@@ -257,13 +265,20 @@ func (s *mongoStore) FindByMercureID(ctx context.Context, mercureID string) (int
 }
 
 // markSeen records the visible Mercure ID in the seen collection and reports
-// whether this call created the marker, that is whether the ID had never been
-// published before. The upsert is atomic on a single document, so two publishers
-// of the same new ID cannot both observe it as new.
+// whether this call created the marker, that is whether the ID has no occurrence
+// in the retention window yet. The upsert is atomic on a single document, so two
+// publishers of the same new ID cannot both observe it as new. last_at tracks the
+// most recent occurrence, so Cleanup can drop the marker once the ID leaves the
+// window and the collection stays bounded.
 func (s *mongoStore) markSeen(ctx context.Context, mercureID string) (bool, error) {
+	now := time.Now().UTC()
+
 	res, err := s.seen.UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: mercureID}},
-		bson.D{{Key: "$setOnInsert", Value: bson.D{{Key: "created_at", Value: time.Now().UTC()}}}},
+		bson.D{
+			{Key: "$set", Value: bson.D{{Key: "last_at", Value: now}}},
+			{Key: "$setOnInsert", Value: bson.D{{Key: "created_at", Value: now}}},
+		},
 		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
@@ -352,7 +367,20 @@ func (s *mongoStore) Cleanup(ctx context.Context, retention int64) error {
 		return fmt.Errorf("deleting events past retention: %w", err)
 	}
 
+	// Drop the seen markers whose last occurrence predates the oldest retained
+	// event, so the collection stays bounded by the retention window.
+	if _, err := s.seen.DeleteMany(ctx, bson.D{{Key: "last_at", Value: bson.D{{Key: "$lt", Value: boundary.CreatedAt}}}}); err != nil {
+		return fmt.Errorf("deleting seen markers past retention: %w", err)
+	}
+
 	return nil
+}
+
+// ResetSequence discards the cached sequence after the events collection was
+// dropped or renamed. The next Append reads the empty collection and starts at
+// 1 again.
+func (s *mongoStore) ResetSequence() {
+	s.hint.Store(0)
 }
 
 // Watch opens the change stream, optionally resuming after the given token.
@@ -490,7 +518,8 @@ func isResumeTokenError(err error) bool {
 	var cmdErr mongo.CommandError
 	if errors.As(err, &cmdErr) {
 		switch cmdErr.Code {
-		case 280, // ChangeStreamFatalError
+		case 260, // InvalidResumeToken
+			280, // ChangeStreamFatalError
 			286: // ChangeStreamHistoryLost
 			return true
 		}

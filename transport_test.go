@@ -384,11 +384,42 @@ func TestRecoverGapDisconnectsSubscribers(t *testing.T) {
 	}
 }
 
-func TestRepeatedIDAfterRetentionIsAmbiguous(t *testing.T) {
+func TestRepeatedIDIsAmbiguous(t *testing.T) {
 	t.Parallel()
 
 	st := newMemoryStore()
 	tr := newBareTransport(st)
+	ctx := t.Context()
+
+	// X is published twice, and the second occurrence is still in the window.
+	require.NoError(t, st.Append(ctx, &eventDoc{MercureID: "X", Topics: []string{testTopic}, Data: "1"}))
+
+	for i := 2; i <= 5; i++ {
+		require.NoError(t, st.Append(ctx, &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}))
+	}
+
+	second := &eventDoc{MercureID: "X", Topics: []string{testTopic}, Data: "2"}
+	require.NoError(t, st.Append(ctx, second))
+	require.False(t, second.First, "a repeated ID must not be the first occurrence while an earlier one is retained")
+
+	// Retention removes the first occurrence of X but keeps the second.
+	require.NoError(t, st.Cleanup(ctx, 4))
+
+	tr.committed = 6
+
+	// A client that saw the first occurrence of X reconnects. The earliest
+	// retained occurrence is the second one, and the marker still records the
+	// earlier occurrence, so the position is ambiguous: answer earliest, not the
+	// events after the second occurrence.
+	s := newTestSubscriber("X", []string{testTopic}, nil)
+	require.NoError(t, tr.AddSubscriber(ctx, s))
+	assertNoEvent(t, s)
+}
+
+func TestRepeatedIDAfterRetentionIsTreatedAsNew(t *testing.T) {
+	t.Parallel()
+
+	st := newMemoryStore()
 	ctx := t.Context()
 
 	require.NoError(t, st.Append(ctx, &eventDoc{MercureID: "X", Topics: []string{testTopic}, Data: "1"}))
@@ -397,25 +428,16 @@ func TestRepeatedIDAfterRetentionIsAmbiguous(t *testing.T) {
 		require.NoError(t, st.Append(ctx, &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}))
 	}
 
-	// Retention removes the first occurrence of X.
+	// Retention removes the only occurrence of X, so its seen marker is dropped
+	// with it.
 	require.NoError(t, st.Cleanup(ctx, 3))
 
 	second := &eventDoc{MercureID: "X", Topics: []string{testTopic}, Data: "2"}
 	require.NoError(t, st.Append(ctx, second))
-	require.False(t, second.First, "a repeated ID must not be the first occurrence after retention removed the earlier one")
 
-	for i := 7; i <= 9; i++ {
-		require.NoError(t, st.Append(ctx, &eventDoc{MercureID: strconv.Itoa(i), Topics: []string{testTopic}, Data: "x"}))
-	}
-
-	tr.committed = 9
-
-	// A client that saw the deleted first occurrence of X reconnects. Its
-	// position is ambiguous, so it must be answered earliest, not served the
-	// events after the second occurrence.
-	s := newTestSubscriber("X", []string{testTopic}, nil)
-	require.NoError(t, tr.AddSubscriber(ctx, s))
-	assertNoEvent(t, s)
+	// A reuse after the ID left the window is treated as a new ID. This is the
+	// documented trade-off of bounding the seen collection to the window.
+	assert.True(t, second.First)
 }
 
 func TestReplayRangeWithRetentionHoleAnswersEarliest(t *testing.T) {

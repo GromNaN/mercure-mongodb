@@ -184,6 +184,7 @@ mercure {
 | `database`            | `mercure`     | Database that holds the events and checkpoints.                    |
 | `collection`          | `updates`     | Collection of update documents.                                    |
 | `checkpoints`         | `checkpoints` | Collection of hub checkpoints (change stream resume tokens).      |
+| `seen`                | `seen_ids`    | Collection of visible ID markers, bounded to the retention window. |
 | `retention`           | `0`           | Number of newest updates kept. `0` keeps everything.               |
 | `cleanup_interval`    | `30s`         | How often the retention cleanup runs.                              |
 | `checkpoint_interval` | `1s`          | How often the resume token is saved.                               |
@@ -203,6 +204,13 @@ transport never logs the connection string.
   ID. When the ID is unknown, or was removed by retention, the hub answers with
   `earliest` so the client can reload its state. This matches the Bolt
   transport.
+- **Repeated visible IDs.** A publisher retry can store the same update twice
+  under two sequences and one visible ID. The hub resolves the ID to its
+  earliest occurrence still in the retention window, and answers `earliest`
+  instead of replaying a suffix that would skip updates. The `seen_ids`
+  collection records the IDs that still have an occurrence in the window, so it
+  stays bounded: a marker is dropped once the ID leaves the window, and a reuse
+  after that is treated as a new ID.
 - **Change stream dependency.** Delivery needs a healthy change stream. The
   transport reports its health through `Ready` and `Live`, and reconnects with
   exponential backoff. A hub that loses the stream catches up from the durable
@@ -264,8 +272,12 @@ over the slowest link.
 - **Oplog window.** A longer oplog lets a hub resume a change stream after a
   longer outage without a full catch up. Size the oplog for the outage you want
   to tolerate.
-- **Backups.** The `updates` collection is the durable history. Back it up with
-  your usual MongoDB tooling. Restoring it restores replay for `Last-Event-ID`.
+- **Backups.** The `updates` collection is the durable history. The `seen_ids`
+  collection is correctness-critical state too: it records whether a visible ID
+  is new, which decides between a replay and an `earliest` answer. Back up both,
+  and the `checkpoints` collection, with your usual MongoDB tooling. Restoring
+  only `updates` loses the ID markers, so a reused ID can be mistaken for a new
+  one.
 - **Reverse proxy.** Configure your proxy to keep SSE connections open: disable
   response buffering and raise the read timeout above the hub heartbeat.
 - **Observability.** The transport exposes `Ready`, `Live` and `Lag`. A hub that

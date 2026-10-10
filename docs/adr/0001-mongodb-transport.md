@@ -148,9 +148,21 @@ transport. The advertised contract matches the data that is actually kept: if
 the operator sets a small retention, reconnects beyond that window get `earliest`.
 
 A requested `Last-Event-ID` that resolves to a document resolves to the earliest
-occurrence of that ID. If a publisher reused an ID, the client is replayed from
-the first occurrence, so it can receive an update it already had. This is a
-deliberate at least once choice: replaying too much is safe, skipping is not.
+occurrence of that ID still in the retention window. When that occurrence is not
+the first occurrence of the ID, an earlier one was removed by retention and the
+client position is ambiguous: replaying from the retained occurrence would skip
+the events between the two, so the transport answers `earliest` instead. This
+happens on a publisher retry after an ambiguous write error, which stores the
+same update twice under two sequences and one visible ID.
+
+To detect it, the `seen_ids` collection records every visible Mercure ID and the
+time of its most recent occurrence, and each event document carries a `First`
+flag set at append time. The collection is bounded to the retention window:
+`Cleanup` drops a marker once the ID has no occurrence left in the window, so a
+reuse after the ID left the window is treated as a new ID. A client that saw the
+earlier occurrence can then be replayed a suffix that skips updates. This is the
+accepted trade-off for a bounded collection. Within the window the marker is
+exact.
 
 ### 4. Change streams and checkpoints
 
