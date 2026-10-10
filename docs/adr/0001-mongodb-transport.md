@@ -90,9 +90,20 @@ so the transport reads from the primary and writes with `w:majority`. A
 secondary read could return a stale maximum and an acknowledgement from a rolled
 back write would break the proof.
 
-Neither an ObjectID nor a wall clock timestamp gives this property. An ObjectID
-carries a random part and a per process counter, and a timestamp is not
-monotonic with the commit order. They are not used as the order.
+What order does the transport need? It does not need a causal order: two
+simultaneous publishes have no true order, and Mercure does not require one. It
+needs a single total order that every hub agrees on, so that the live path (the
+change stream order) and the replay path (an `_id` range) observe the same
+sequence. The optimistic sequence gives that, and it also makes the order equal
+to the commit order, which is what the replay/live boundary relies on.
+
+An ObjectID does not give this property. It is 12 bytes: a 4 byte timestamp in
+seconds (big endian), a 5 byte per process random value, and a 3 byte counter.
+Because the timestamp is the leading field and the comparison is byte wise,
+ObjectIDs created in different seconds sort by time across servers, but within
+the same second the order between two servers is fixed by their random process
+value, not by the real generation time. A wall clock timestamp is not monotonic
+with the commit order either. Neither one is used as the order.
 
 Cost: concurrent publishers on the same collection collide on the candidate and
 retry. Under a single hub the transport serializes local candidate allocation
@@ -275,13 +286,102 @@ Integration tests run against a replica set, not a standalone.
 * Delivery depends on the change stream. The transport surfaces its health and
   its lag.
 
-## Alternatives rejected
+## Alternatives considered and rejected
 
-* ObjectID or timestamp ordering: no proof of a total order consistent with
-  commits (see decision 2).
-* A global counter document with `$inc`: simple, but the counter value is
-  assigned before the insert commits, so concurrent inserts can commit out of
-  counter order. That breaks the contiguity needed by the replay/live boundary.
-* Local immediate broadcast plus change stream: reintroduces the duplicate and
-  the cross source ordering problem (see decision 6).
-* Age based TTL retention: can restart the sequence at 1 (see decision 3).
+This section records the options that were evaluated for the two hard problems:
+a deterministic order, and retention.
+
+### Ordering
+
+**ObjectID.** Rejected in decision 2. It is sortable across servers, but only
+approximately by time, and it is not gapless and not aligned with the commit
+order.
+
+**Wall clock timestamp.** Not monotonic with the commit order, and subject to
+clock skew between servers. Rejected in decision 2.
+
+**Natural order (`$natural`, `recordId`).** Natural order is the order in which
+WiredTiger record ids are created and stored. It is the default order of a
+collection scan on a single node, but the official documentation states that in
+a replica set natural order is not guaranteed to be consistent and can differ
+between members, and that in a sharded collection natural order is not defined.
+A natural order read is only consistent when the whole read runs on one replica
+set node, so it cannot be resumed on another node, and mongos does not support
+`$_requestResumeToken` for natural order reads. `SERVER-82180` notes that capped
+inserts can even have a different natural ordering on the primary than on the
+secondaries. A per node storage order cannot be a cursor shared by every hub, so
+natural order is rejected.
+
+**Oplog order and `clusterTime`.** Within a single replica set, writes have a
+total order defined by the oplog and its monotonically increasing optimes.
+Change streams deliver events in that order, and in a sharded cluster mongos
+merges the shards deterministically into one ordered stream. Each change event
+carries a `clusterTime`, a logical clock synchronized across the deployment.
+This is the closest native primitive to a deterministic insertion order, and it
+is what the live path already follows. Two limits keep it out of the replay
+design: `clusterTime` has per second granularity, so two events on different
+shards in the same second can be merged in a non deterministic order, and
+starting in MongoDB 8.0 a bulk insert outside a transaction can be written as a
+single oplog entry, so every document in the batch shares one `clusterTime`. The
+documented fix for strict ordering is an application level sequence field, which
+is what this transport uses, or transactions (`lsid` and `txnNumber`). A
+`clusterTime` is also not stored on the document, so it cannot be a range key
+for replay without an extra write.
+
+**Counter collection with `$inc`.** A separate counters collection with one
+document per sequence, updated with `findAndModify` and `$inc`, returns a unique
+increasing value. This is the documented auto incrementing sequence pattern, and
+it removes the duplicate key retry of decision 2. It is rejected for three
+reasons. The counter document is a single global hot document, so every publish
+on every hub serializes on it. The value is allocated before the insert commits,
+so a failed insert consumes a number and leaves a permanent hole, which the
+replay contiguity check cannot distinguish from a retention delete; keeping the
+sequence gapless would require wrapping the allocation and the insert in one
+transaction, which reintroduces `WriteConflict` retries on the counter document.
+Finally, because two allocations are independent, a hub can allocate a low
+number and commit it after another hub committed a higher one, so `_id` order no
+longer equals commit order, and the live path and the replay path can disagree.
+The objection that rejects the ObjectID applies again.
+
+**`$merge` in an aggregation.** Reading the current maximum with `$sort` and
+`$limit` and writing the new document with `$merge` in one pipeline does not make
+the read and the write atomic: two pipelines can read the same maximum and both
+try to merge `max + 1`. It still needs the duplicate key retry, it needs a
+special case for an empty collection, and it loses the local index hint used to
+read the maximum. It is more complexity for the same guarantees.
+
+**Collection level write lock.** MongoDB has no user facing collection write
+lock. WiredTiger concurrency control is at the document level, with optimistic
+concurrency and intent locks. The ways to serialize writers are a unique index
+plus a retry (this design), a transaction that aborts with `WriteConflict` and
+retries, or a distributed lock outside the database. `db.fsyncLock()` exists but
+is server wide and is meant for backups. There is no lock mode to lean on, so
+the unique index on `_id` is the serialization point.
+
+**Replicated record ids (future).** A server work in progress would expose the
+storage `recordId` in change stream events for collections created with
+`recordIdsReplicated: true`, with range filtering and resuming by record id, and
+a monotonic guarantee per replica set. The driver change stream decision
+(`DRIVERS-2654`) has punted it, so it is not available to change stream
+consumers today. If it ships, it could replace the application sequence. It is
+the only native primitive that could.
+
+**Local immediate broadcast plus change stream.** Reintroduces the duplicate and
+the cross source ordering problem (see decision 6).
+
+### Retention and storage
+
+**Capped collection.** A capped collection preserves insertion order and
+overwrites the oldest documents when it reaches its size, which matches the
+append only log and would remove the cleanup job. It is rejected for this
+transport. Retention would be size based in bytes (the document count cap is
+only secondary), while Mercure retention is a count, so the `retention` option
+could not keep its meaning. Documents cannot be deleted individually, so
+`Cleanup` and manual purge disappear. The collection cannot be sharded, which
+blocks horizontal scale. Resizing is a maintenance operation. It does not remove
+the sequence problem either, the write path is unchanged. Its one real
+advantage, that retention is always a prefix overwrite, is already true of count
+based deletion.
+
+**TTL index.** Rejected in decision 3. A time based expiry can delete the newest
+document when it is also the oldest, which can restart the sequence at 1.
