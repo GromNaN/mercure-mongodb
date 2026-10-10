@@ -172,8 +172,9 @@ The subscriber receives the update through MongoDB.
 
 Prebuilt images are published to the GitHub Container Registry on every version
 tag: `ghcr.io/gromnan/mercure-mongodb`. They bundle the Mercure hub and this
-transport, so there is nothing to build. Each release publishes the version tag
-and `latest`.
+transport, so there is nothing to build. A stable release publishes the version
+tag and moves `latest`; a prerelease publishes only its version tag, so `latest`
+always points at the newest stable release.
 
 The image runs the default [`Caddyfile`](Caddyfile), which reads its
 configuration from the environment.

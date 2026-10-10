@@ -535,15 +535,18 @@ func (t *MongoDBTransport) Close(ctx context.Context) error {
 		// The caller's context is unusable for cleanup: it can already be
 		// canceled, and during a Caddy shutdown caddy.ActiveContext carries no
 		// embedded context at all, so the MongoDB driver panics when it reads a
-		// value or a deadline. Use a fresh context, bounded by its own timeout,
-		// so the checkpoint and the disconnect still run.
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		defer cancel()
+		// value or a deadline. Use a fresh context for each step, bounded by its
+		// own timeout, so a checkpoint that blocks until the deadline cannot
+		// leave the disconnect with an already expired context.
+		checkpointCtx, cancelCheckpoint := context.WithTimeout(context.Background(), closeTimeout)
+		t.saveCheckpoint(checkpointCtx)
+		cancelCheckpoint()
 
-		t.saveCheckpoint(cleanupCtx)
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancelClose()
 
-		if err := t.store.Close(cleanupCtx); err != nil && t.logger != nil {
-			t.logger.LogAttrs(cleanupCtx, slog.LevelError, "Unable to close MongoDB", slog.Any("error", err))
+		if err := t.store.Close(closeCtx); err != nil && t.logger != nil {
+			t.logger.LogAttrs(closeCtx, slog.LevelError, "Unable to close MongoDB", slog.Any("error", err))
 		}
 	})
 
