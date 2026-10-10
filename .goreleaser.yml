@@ -30,8 +30,11 @@ builds:
       - -X 'github.com/caddyserver/caddy/v2/modules/caddyhttp.ServerHeader=Mercure.rocks Caddy'
       - -X 'github.com/caddyserver/caddy/v2.CustomVersion=Mercure.rocks {{ .Version }} Caddy'
       - -X 'github.com/caddyserver/caddy/v2.CustomBinaryName=mercure-mongodb'
-    # The same build tags as the Mercure hub, so the image accepts the mercure
-    # JWT claim, the topic query parameter and the other deprecated options.
+    # Build tags, the same as the Mercure hub release. The deprecated_* tags
+    # compile in the Mercure v0.x compatibility mode, which only takes effect
+    # when a configuration sets protocol_version_compatibility. The nobadger,
+    # nomysql and nopgx tags match the upstream release build; Mercure v1.1.0
+    # no longer reads them.
     tags:
       - deprecated_transport
       - deprecated_topic
@@ -58,8 +61,14 @@ archives:
       {{- if .Arm }}v{{ .Arm }}{{ end }}
     files:
       - LICENSE
+      - COPYRIGHT
       - README.md
       - Caddyfile
+
+# One SPDX SBOM per archive, attached to the GitHub release. The cataloging step
+# shells out to syft, which the release workflow installs.
+sboms:
+  - artifacts: archive
 
 dockers_v2:
   - ids:
@@ -79,5 +88,8 @@ dockers_v2:
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.created: "{{ .Date }}"
+    # Attach an SBOM attestation to the image manifest in the registry.
+    sbom: true
+    # Files the Dockerfile copies out of the build context.
     extra_files:
       - Caddyfile

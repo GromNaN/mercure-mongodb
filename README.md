@@ -1,7 +1,7 @@
 # mercure-mongodb
 
 [![CI](https://github.com/GromNaN/mercure-mongodb/actions/workflows/ci.yml/badge.svg)](https://github.com/GromNaN/mercure-mongodb/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License: AGPL 3.0](https://img.shields.io/badge/license-AGPL_3.0-blue)](LICENSE)
 [![Go 1.27](https://img.shields.io/badge/go-1.27-00ADD8)](https://go.dev/)
 
 A [MongoDB](https://www.mongodb.com/) transport for the [Mercure](https://mercure.rocks) hub.
@@ -192,12 +192,16 @@ configuration from the environment.
 | `MERCURE_PUBLISHER_JWT_ALG`  | `HS256`              | Publisher JWT algorithm.                              |
 | `MERCURE_SUBSCRIBER_JWT_ALG` | `HS256`              | Subscriber JWT algorithm.                             |
 
-Start a MongoDB replica set and the hub on the same network:
+Start a MongoDB replica set and the hub on the same network. Wait for MongoDB to
+finish initializing its replica set before you start the hub: the hub refuses to
+provision while the replica set is not ready.
 
 ```console
 docker network create mercure
 docker run -d --name mongodb --network mercure \
   mongodb/mongodb-atlas-local:latest
+# The image ships a healthcheck, so this returns once the replica set is ready.
+until [ "$(docker inspect -f '{{.State.Health.Status}}' mongodb)" = healthy ]; do sleep 1; done
 docker run -d --name mercure --network mercure -p 3000:3000 \
   -e SERVER_NAME=:3000 \
   -e MERCURE_TRUSTED_ISSUERS='http://localhost:3000' \
@@ -394,6 +398,15 @@ replica set, because change streams are not available on a standalone server.
 
 ## License
 
-[MIT](LICENSE). This module is a separate work that plugs into the Mercure hub
-through its public transport interface. Mercure itself stays under
-AGPL-3.0-or-later.
+This project is under the [AGPL 3.0 license](LICENSE).
+
+The image and the release archives bundle three works:
+
+| Work            | License    | License file                                                          |
+| --------------- | ---------- | --------------------------------------------------------------------- |
+| mercure-mongodb | AGPL 3.0   | [`LICENSE`](LICENSE)                                                  |
+| Mercure hub     | AGPL 3.0   | [`LICENSE`](https://github.com/dunglas/mercure/blob/main/LICENSE)     |
+| Caddy           | Apache-2.0 | [`LICENSE`](https://github.com/caddyserver/caddy/blob/master/LICENSE) |
+
+The hub serves users over a network, so the AGPL network clause applies: if you
+run a modified version, you must offer its source to the users it serves.
