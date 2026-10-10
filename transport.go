@@ -28,7 +28,8 @@ const (
 	// collection.
 	minEarliestReplayWindow = 10000
 
-	// reconnect backoff bounds for the change stream consumer.
+	// Backoff bounds for the consumer. They cover both opening the initial
+	// connection and reconnecting the change stream after it is lost.
 	reconnectMin = 250 * time.Millisecond
 	reconnectMax = 30 * time.Second
 
@@ -109,6 +110,23 @@ func (c *Config) withDefaults() {
 	}
 }
 
+// storeOpener opens the store the transport runs on. The MongoDB implementation
+// contacts the server, so the transport can defer the connection and start
+// without a reachable MongoDB. The unit tests inject an already opened store.
+type storeOpener interface {
+	open(ctx context.Context) (store, error)
+}
+
+// staticOpener returns a store that is already open. It is used by the unit
+// tests, which inject a memory store.
+type staticOpener struct {
+	st store
+}
+
+func (o staticOpener) open(context.Context) (store, error) {
+	return o.st, nil
+}
+
 // MongoDBTransport implements mercure.Transport on top of MongoDB. It stores a
 // durable, ordered history of updates and uses a change stream to deliver them
 // to every hub instance.
@@ -118,7 +136,7 @@ func (c *Config) withDefaults() {
 // delivered twice and never out of order, and it decouples publish throughput
 // from fan out.
 type MongoDBTransport struct {
-	store       store
+	opener      storeOpener
 	subscribers *mercure.SubscriberList
 	logger      *slog.Logger
 
@@ -132,6 +150,18 @@ type MongoDBTransport struct {
 
 	closed     chan struct{}
 	closedOnce sync.Once
+
+	// storeMu guards store, watermarkSet and the connection attempt itself. A
+	// single client is shared by the consumer and by the request path, so
+	// concurrent callers wait for the attempt in flight instead of opening a
+	// second one.
+	storeMu sync.Mutex
+	store   store
+
+	// watermarkSet records whether committed and lastEventID were read from the
+	// durable state. That happens once, on the first connection, so a reconnect
+	// never jumps the watermark forward over events that were not delivered.
+	watermarkSet bool
 
 	// mu guards committed, lastEventID, lastToken and liveFloors.
 	//
@@ -149,11 +179,14 @@ type MongoDBTransport struct {
 	healthy atomic.Bool
 }
 
-// NewMongoDBTransport connects to MongoDB and starts the change stream consumer.
-func NewMongoDBTransport(ctx context.Context, subscribers *mercure.SubscriberList, logger *slog.Logger, cfg Config) (*MongoDBTransport, error) {
+// NewMongoDBTransport builds the transport and starts the consumer. It does not
+// contact MongoDB: the connection is opened on first use, and the consumer
+// retries it until the server answers. A hub that starts before MongoDB is
+// ready, or while it is down, therefore starts instead of failing.
+func NewMongoDBTransport(subscribers *mercure.SubscriberList, logger *slog.Logger, cfg Config) *MongoDBTransport {
 	cfg.withDefaults()
 
-	st, err := newMongoStore(ctx, mongoConfig{
+	t := newTransport(&mongoOpener{cfg: mongoConfig{
 		URI:            cfg.URI,
 		Database:       cfg.Database,
 		Collection:     cfg.Collection,
@@ -162,30 +195,21 @@ func NewMongoDBTransport(ctx context.Context, subscribers *mercure.SubscriberLis
 		HubName:        cfg.HubName,
 		WatchAwaitTime: cfg.WatchAwaitTime,
 		ConnectTimeout: cfg.ConnectTimeout,
-	})
-	if err != nil {
-		return nil, err
-	}
+	}}, subscribers, logger, cfg)
+	t.start()
 
-	t, err := newTransportWithStore(ctx, st, subscribers, logger, cfg)
-	if err != nil {
-		_ = st.Close(context.Background())
-
-		return nil, err
-	}
-
-	return t, nil
+	return t
 }
 
-// newTransportWithStore builds the transport on an existing store. It is shared
-// by the public constructor and by the unit tests, which inject a memory store.
-func newTransportWithStore(ctx context.Context, st store, subscribers *mercure.SubscriberList, logger *slog.Logger, cfg Config) (*MongoDBTransport, error) {
+// newTransport builds the transport without starting the consumer, so a caller
+// can attach an already opened store first.
+func newTransport(opener storeOpener, subscribers *mercure.SubscriberList, logger *slog.Logger, cfg Config) *MongoDBTransport {
 	cfg.withDefaults()
 
 	consumerCtx, cancel := context.WithCancel(context.Background())
 
-	t := &MongoDBTransport{
-		store:              st,
+	return &MongoDBTransport{
+		opener:             opener,
 		subscribers:        subscribers,
 		logger:             logger,
 		retention:          cfg.Retention,
@@ -197,41 +221,114 @@ func newTransportWithStore(ctx context.Context, st store, subscribers *mercure.S
 		lastEventID:        mercure.EarliestLastEventID,
 		liveFloors:         make(map[*mercure.LocalSubscriber]int64),
 	}
+}
 
-	// The applied watermark starts at the durable maximum. Anything committed
-	// before this point is history for a future subscriber, not a live event.
-	max, err := st.MaxSeq(ctx)
-	if err != nil {
-		cancel()
-		_ = st.Close(context.Background())
-
-		return nil, err
-	}
-
-	t.committed = max
-
-	latest, err := st.Latest(ctx)
-	if err != nil {
-		cancel()
-		_ = st.Close(context.Background())
-
-		return nil, err
-	}
-
-	if latest != nil {
-		t.lastEventID = latest.MercureID
-	}
-
+// start launches the consumer and the timer loops.
+func (t *MongoDBTransport) start() {
 	t.wg.Add(2)
 	go t.consume()
 	go t.checkpointLoop()
 
-	if cfg.Retention > 0 {
+	if t.retention > 0 {
 		t.wg.Add(1)
 		go t.cleanupLoop()
 	}
+}
+
+// newTransportWithStore builds the transport on an already opened store. It is
+// used by the unit tests, which inject a memory store.
+func newTransportWithStore(ctx context.Context, st store, subscribers *mercure.SubscriberList, logger *slog.Logger, cfg Config) (*MongoDBTransport, error) {
+	t := newTransport(staticOpener{st: st}, subscribers, logger, cfg)
+
+	// The store is already open, so the watermark can be read now, as the
+	// MongoDB path does on its first successful connection.
+	if err := t.initWatermark(ctx, st); err != nil {
+		t.cancel()
+		_ = st.Close(context.Background())
+
+		return nil, err
+	}
+
+	t.store = st
+	t.start()
 
 	return t, nil
+}
+
+// ensureStore returns the connected store, opening it on first use. The consumer
+// and the request path share one client: a caller that arrives while an attempt
+// is in flight waits for it instead of opening a second one.
+//
+// A failure is returned as is, so the caller can report it. The consumer retries
+// it with backoff, which is what makes the hub survive a MongoDB that is not
+// ready yet or that restarts.
+func (t *MongoDBTransport) ensureStore(ctx context.Context) (store, error) {
+	t.storeMu.Lock()
+	defer t.storeMu.Unlock()
+
+	if t.store != nil {
+		return t.store, nil
+	}
+
+	st, err := t.opener.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if !t.watermarkSet {
+		if err := t.initWatermark(ctx, st); err != nil {
+			_ = st.Close(context.Background())
+
+			return nil, err
+		}
+	}
+
+	select {
+	case <-t.closed:
+		_ = st.Close(context.Background())
+
+		return nil, mercure.ErrClosedTransport
+	default:
+	}
+
+	t.store = st
+
+	return st, nil
+}
+
+// currentStore returns the connected store, or nil while MongoDB is not
+// connected. It never opens a connection.
+func (t *MongoDBTransport) currentStore() store {
+	t.storeMu.Lock()
+	defer t.storeMu.Unlock()
+
+	return t.store
+}
+
+// initWatermark reads the durable maximum and the latest event, so the applied
+// watermark starts where the collection ends. Anything committed before that
+// point is history for a future subscriber, not a live event.
+func (t *MongoDBTransport) initWatermark(ctx context.Context, st store) error {
+	max, err := st.MaxSeq(ctx)
+	if err != nil {
+		return err
+	}
+
+	latest, err := st.Latest(ctx)
+	if err != nil {
+		return err
+	}
+
+	t.mu.Lock()
+	t.committed = max
+	if latest != nil {
+		t.lastEventID = latest.MercureID
+	}
+	t.mu.Unlock()
+
+	t.watermarkSet = true
+
+	return nil
 }
 
 // Dispatch persists the update and assigns its sequence. Delivery to
@@ -247,10 +344,17 @@ func (t *MongoDBTransport) Dispatch(ctx context.Context, update *mercure.Update)
 	default:
 	}
 
+	// The connection is opened on first use, so a publish can be the first
+	// operation that needs MongoDB.
+	st, err := t.ensureStore(ctx)
+	if err != nil {
+		return fmt.Errorf("persisting update: %w", err)
+	}
+
 	update.AssignUUID()
 
 	doc := newEventDoc(update, time.Now().UTC())
-	if err := t.store.Append(ctx, doc); err != nil {
+	if err := st.Append(ctx, doc); err != nil {
 		return fmt.Errorf("persisting update: %w", err)
 	}
 
@@ -265,9 +369,16 @@ func (t *MongoDBTransport) AddSubscriber(ctx context.Context, s *mercure.LocalSu
 	default:
 	}
 
+	// Open the connection before reading the client position, so the watermark
+	// snapshot below is taken on the connected store.
+	st, err := t.ensureStore(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Resolve the client position before taking the lock, because it needs a
 	// database lookup.
-	haveSeq, found, first, resolveErr := t.resolveRequestedID(ctx, s)
+	haveSeq, found, first, resolveErr := t.resolveRequestedID(ctx, st, s)
 	if resolveErr != nil {
 		s.HistoryDispatched(mercure.EarliestLastEventID)
 
@@ -304,7 +415,7 @@ func (t *MongoDBTransport) AddSubscriber(ctx context.Context, s *mercure.LocalSu
 	}
 
 	if s.RequestLastEventIDSet {
-		if err := t.replay(ctx, s, bound, haveSeq, found, first); err != nil {
+		if err := t.replay(ctx, st, s, bound, haveSeq, found, first); err != nil {
 			return err
 		}
 	}
@@ -319,13 +430,13 @@ func (t *MongoDBTransport) AddSubscriber(ctx context.Context, s *mercure.LocalSu
 // removed by retention, or is empty. first is false when the earliest retained
 // occurrence is not the first occurrence of the id, which means an earlier one
 // was removed and the client position is ambiguous.
-func (t *MongoDBTransport) resolveRequestedID(ctx context.Context, s *mercure.LocalSubscriber) (seq int64, found, first bool, err error) {
+func (t *MongoDBTransport) resolveRequestedID(ctx context.Context, st store, s *mercure.LocalSubscriber) (seq int64, found, first bool, err error) {
 	requested := s.RequestLastEventID
 	if requested == "" || requested == mercure.EarliestLastEventID {
 		return 0, false, false, nil
 	}
 
-	seq, found, first, err = t.store.FindByMercureID(ctx, requested)
+	seq, found, first, err = st.FindByMercureID(ctx, requested)
 	if err != nil {
 		return 0, false, false, err
 	}
@@ -335,7 +446,7 @@ func (t *MongoDBTransport) resolveRequestedID(ctx context.Context, s *mercure.Lo
 
 // replay sends the history the subscriber is missing, then calls
 // HistoryDispatched exactly once.
-func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscriber, bound, haveSeq int64, found, first bool) error {
+func (t *MongoDBTransport) replay(ctx context.Context, st store, s *mercure.LocalSubscriber, bound, haveSeq int64, found, first bool) error {
 	requested := s.RequestLastEventID
 
 	switch {
@@ -347,7 +458,7 @@ func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscribe
 
 		// The "earliest" window may start before the oldest retained event, so a
 		// partial range is expected and complete is false.
-		return t.replayRange(ctx, s, from, bound, mercure.EarliestLastEventID, false)
+		return t.replayRange(ctx, st, s, from, bound, mercure.EarliestLastEventID, false)
 
 	case !found || !first:
 		// The requested id is unknown, was removed by retention, or resolves to
@@ -369,7 +480,7 @@ func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscribe
 		// hub lags behind the client. The range must be complete: retention can
 		// delete events between the lookup and the scan, and a partial range
 		// would silently skip updates.
-		return t.replayRange(ctx, s, haveSeq, bound, requested, true)
+		return t.replayRange(ctx, st, s, haveSeq, bound, requested, true)
 	}
 }
 
@@ -378,11 +489,11 @@ func (t *MongoDBTransport) replay(ctx context.Context, s *mercure.LocalSubscribe
 // the range is not fully covered, the subscriber is answered "earliest" instead
 // of being served a partial range, because retention removed events between the
 // lookup and the scan.
-func (t *MongoDBTransport) replayRange(ctx context.Context, s *mercure.LocalSubscriber, fromExclusive, toInclusive int64, responseLastEventID string, complete bool) error {
+func (t *MongoDBTransport) replayRange(ctx context.Context, st store, s *mercure.LocalSubscriber, fromExclusive, toInclusive int64, responseLastEventID string, complete bool) error {
 	expected := fromExclusive + 1
 	incomplete := false
 
-	err := t.store.Scan(ctx, fromExclusive, toInclusive, func(doc *eventDoc) bool {
+	err := st.Scan(ctx, fromExclusive, toInclusive, func(doc *eventDoc) bool {
 		if doc.Seq != expected {
 			// The range has a hole, which only retention can cause. Stop before
 			// dispatching the suffix.
@@ -474,7 +585,12 @@ func (t *MongoDBTransport) GetSubscribers(_ context.Context) (string, []*mercure
 
 // Lag returns how many committed events this hub has not applied yet.
 func (t *MongoDBTransport) Lag(ctx context.Context) (int64, error) {
-	max, err := t.store.MaxSeq(ctx)
+	st := t.currentStore()
+	if st == nil {
+		return 0, errNotConnected
+	}
+
+	max, err := st.MaxSeq(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -498,7 +614,7 @@ func (t *MongoDBTransport) Ready(context.Context) error {
 	}
 
 	if !t.healthy.Load() {
-		return errors.New("change stream is not connected")
+		return errNotConnected
 	}
 
 	return nil
@@ -512,7 +628,12 @@ func (t *MongoDBTransport) Live(ctx context.Context) error {
 	default:
 	}
 
-	if err := t.store.Ping(ctx); err != nil {
+	st := t.currentStore()
+	if st == nil {
+		return errNotConnected
+	}
+
+	if err := st.Ping(ctx); err != nil {
 		return fmt.Errorf("MongoDB ping failed: %w", err)
 	}
 
@@ -542,10 +663,17 @@ func (t *MongoDBTransport) Close(ctx context.Context) error {
 		t.saveCheckpoint(checkpointCtx)
 		cancelCheckpoint()
 
+		// MongoDB may never have been reached, in which case there is nothing to
+		// disconnect.
+		st := t.currentStore()
+		if st == nil {
+			return
+		}
+
 		closeCtx, cancelClose := context.WithTimeout(context.Background(), closeTimeout)
 		defer cancelClose()
 
-		if err := t.store.Close(closeCtx); err != nil && t.logger != nil {
+		if err := st.Close(closeCtx); err != nil && t.logger != nil {
 			t.logger.LogAttrs(closeCtx, slog.LevelError, "Unable to close MongoDB", slog.Any("error", err))
 		}
 	})
@@ -553,23 +681,64 @@ func (t *MongoDBTransport) Close(ctx context.Context) error {
 	return nil
 }
 
-// consume reads the change stream and delivers events, reconnecting with
-// backoff. When the resume token can no longer be used, it catches up from the
-// durable collection and restarts the stream.
+// consume connects to MongoDB and reads the change stream, delivering events.
+// It reconnects with backoff when the connection or the stream is lost, so a
+// hub that starts before MongoDB, or that loses it to a restart, recovers on
+// its own. It returns only when the transport is closed.
+//
+// This loop is what makes the hub start without a reachable MongoDB: the
+// connection is opened here, on first use, and a failure is retried instead of
+// stopping the hub.
 func (t *MongoDBTransport) consume() {
 	defer t.wg.Done()
 
 	backoff := reconnectMin
-	resumeToken := t.loadResumeToken()
+
+	var (
+		resumeToken []byte
+		loaded      bool
+	)
 
 	for {
-		select {
-		case <-t.ctx.Done():
+		if t.ctx.Err() != nil {
 			return
-		default:
 		}
 
-		err := t.consumeOnce(resumeToken)
+		st, err := t.ensureStore(t.ctx)
+		if err != nil {
+			t.healthy.Store(false)
+
+			if t.ctx.Err() != nil {
+				return
+			}
+
+			if t.logger != nil {
+				t.logger.LogAttrs(t.ctx, slog.LevelError, "Unable to connect to MongoDB, retrying",
+					slog.Any("error", err), slog.Duration("backoff", backoff))
+			}
+
+			if !sleep(t.ctx, backoff) {
+				return
+			}
+
+			backoff = min(backoff*2, reconnectMax)
+
+			continue
+		}
+
+		// The connection is up, so the next failure starts from the shortest
+		// backoff.
+		backoff = reconnectMin
+
+		if !loaded {
+			// Read the durable checkpoint once, on the first connection. A later
+			// reconnect resumes from the token the consumer last applied, which
+			// is further along than the stored one.
+			resumeToken = t.loadResumeToken(st)
+			loaded = true
+		}
+
+		err = t.consumeOnce(st, resumeToken)
 		if t.ctx.Err() != nil {
 			return
 		}
@@ -582,7 +751,7 @@ func (t *MongoDBTransport) consume() {
 				t.logger.LogAttrs(t.ctx, slog.LevelError, "Events collection was dropped or renamed, the sequence restarted", slog.Any("error", err))
 			}
 
-			t.reset()
+			t.reset(st)
 			resumeToken = nil
 			backoff = reconnectMin
 
@@ -602,7 +771,7 @@ func (t *MongoDBTransport) consume() {
 
 			// The missing events are gone for good, so retrying the same range
 			// would loop. Disconnect the subscribers and fast forward instead.
-			if recoverErr := t.recoverGap(); recoverErr != nil && t.logger != nil {
+			if recoverErr := t.recoverGap(st); recoverErr != nil && t.logger != nil {
 				t.logger.LogAttrs(t.ctx, slog.LevelError, "Unable to recover from an expired change stream gap", slog.Any("error", recoverErr))
 			}
 
@@ -614,10 +783,8 @@ func (t *MongoDBTransport) consume() {
 				t.logger.LogAttrs(t.ctx, slog.LevelError, "Change stream interrupted, reconnecting", slog.Any("error", err), slog.Duration("backoff", backoff))
 			}
 
-			select {
-			case <-t.ctx.Done():
+			if !sleep(t.ctx, backoff) {
 				return
-			case <-time.After(backoff):
 			}
 
 			backoff = min(backoff*2, reconnectMax)
@@ -626,10 +793,20 @@ func (t *MongoDBTransport) consume() {
 	}
 }
 
+// sleep waits for d, and reports false when the context is done first.
+func sleep(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
 // consumeOnce opens the change stream and delivers events until it fails or the
 // context is cancelled.
-func (t *MongoDBTransport) consumeOnce(resumeToken []byte) error {
-	stream, err := t.store.Watch(t.ctx, resumeToken)
+func (t *MongoDBTransport) consumeOnce(st store, resumeToken []byte) error {
+	stream, err := st.Watch(t.ctx, resumeToken)
 	if err != nil {
 		return err
 	}
@@ -641,7 +818,7 @@ func (t *MongoDBTransport) consumeOnce(resumeToken []byte) error {
 	// the stream. Without a resume token, the stream only sees events after it
 	// opened, so anything committed in between must come from the collection.
 	if len(resumeToken) == 0 {
-		if err := t.catchUp(); err != nil {
+		if err := t.catchUp(st); err != nil {
 			return err
 		}
 	}
@@ -665,7 +842,7 @@ func (t *MongoDBTransport) consumeOnce(resumeToken []byte) error {
 		case opInvalidate:
 			return errInvalidate
 		case opInsert:
-			if err := t.apply(ev.Doc); err != nil {
+			if err := t.apply(st, ev.Doc); err != nil {
 				return err
 			}
 		default:
@@ -684,7 +861,7 @@ func (t *MongoDBTransport) consumeOnce(resumeToken []byte) error {
 // apply delivers one event, first filling any gap between the applied watermark
 // and the event sequence from the durable collection. It returns an error when
 // the gap cannot be filled, so the caller does not advance past missing events.
-func (t *MongoDBTransport) apply(doc *eventDoc) error {
+func (t *MongoDBTransport) apply(st store, doc *eventDoc) error {
 	t.mu.Lock()
 	committed := t.committed
 	t.mu.Unlock()
@@ -694,7 +871,7 @@ func (t *MongoDBTransport) apply(doc *eventDoc) error {
 	}
 
 	if doc.Seq > committed+1 {
-		if err := t.backfill(committed, doc.Seq-1); err != nil {
+		if err := t.backfill(st, committed, doc.Seq-1); err != nil {
 			return fmt.Errorf("backfilling change stream gap (%d, %d]: %w", committed, doc.Seq-1, err)
 		}
 	}
@@ -709,11 +886,11 @@ func (t *MongoDBTransport) apply(doc *eventDoc) error {
 // covered, which means retention removed events that are still needed. In that
 // case nothing is delivered, so the caller can reset instead of exposing a hole
 // in the stream.
-func (t *MongoDBTransport) backfill(fromExclusive, toInclusive int64) error {
+func (t *MongoDBTransport) backfill(st store, fromExclusive, toInclusive int64) error {
 	expected := fromExclusive + 1
 	expired := false
 
-	err := t.store.Scan(t.ctx, fromExclusive, toInclusive, func(doc *eventDoc) bool {
+	err := st.Scan(t.ctx, fromExclusive, toInclusive, func(doc *eventDoc) bool {
 		if doc.Seq != expected {
 			// The range has a hole, which only retention can cause. Stop before
 			// delivering anything, so subscribers never see a partial range.
@@ -782,8 +959,8 @@ func (t *MongoDBTransport) deliver(doc *eventDoc) {
 // not lose the events published during the interruption. It returns an error
 // when the range cannot be read or is no longer retained, so the consumer can
 // retry or reset instead of silently staying behind.
-func (t *MongoDBTransport) catchUp() error {
-	max, err := t.store.MaxSeq(t.ctx)
+func (t *MongoDBTransport) catchUp(st store) error {
+	max, err := st.MaxSeq(t.ctx)
 	if err != nil {
 		return fmt.Errorf("reading the maximum sequence while catching up: %w", err)
 	}
@@ -796,7 +973,7 @@ func (t *MongoDBTransport) catchUp() error {
 		return nil
 	}
 
-	if err := t.backfill(from, max); err != nil {
+	if err := t.backfill(st, from, max); err != nil {
 		return fmt.Errorf("catching up from the durable collection: %w", err)
 	}
 
@@ -807,13 +984,13 @@ func (t *MongoDBTransport) catchUp() error {
 // cannot be served a contiguous stream, so they are disconnected and the
 // watermark is fast forwarded past the missing events. Each client reconnects
 // with its Last-Event-ID and replays from the durable collection.
-func (t *MongoDBTransport) recoverGap() error {
-	max, err := t.store.MaxSeq(t.ctx)
+func (t *MongoDBTransport) recoverGap(st store) error {
+	max, err := st.MaxSeq(t.ctx)
 	if err != nil {
 		return fmt.Errorf("reading the maximum sequence while recovering a gap: %w", err)
 	}
 
-	latest, err := t.store.Latest(t.ctx)
+	latest, err := st.Latest(t.ctx)
 	if err != nil {
 		return fmt.Errorf("reading the latest event while recovering a gap: %w", err)
 	}
@@ -851,8 +1028,8 @@ func (t *MongoDBTransport) recoverGap() error {
 // sequence restarted at 1, so every cached position is invalid: the store
 // discards its cached sequence, the subscribers are disconnected to force a
 // replay, and the watermark goes back to zero.
-func (t *MongoDBTransport) reset() {
-	t.store.ResetSequence()
+func (t *MongoDBTransport) reset(st store) {
+	st.ResetSequence()
 
 	var subscribers []*mercure.LocalSubscriber
 
@@ -875,8 +1052,8 @@ func (t *MongoDBTransport) reset() {
 }
 
 // loadResumeToken returns the stored resume token, or nil when none exists.
-func (t *MongoDBTransport) loadResumeToken() []byte {
-	cp, err := t.store.LoadCheckpoint(t.ctx)
+func (t *MongoDBTransport) loadResumeToken(st store) []byte {
+	cp, err := st.LoadCheckpoint(t.ctx)
 	if err != nil {
 		if t.logger != nil {
 			t.logger.LogAttrs(t.ctx, slog.LevelWarn, "Unable to read checkpoint, starting from the current position", slog.Any("error", err))
@@ -921,6 +1098,12 @@ func (t *MongoDBTransport) checkpointLoop() {
 }
 
 func (t *MongoDBTransport) saveCheckpoint(ctx context.Context) {
+	// There is nothing to persist while MongoDB was never reached.
+	st := t.currentStore()
+	if st == nil {
+		return
+	}
+
 	t.mu.Lock()
 	token := t.lastToken
 	seq := t.committed
@@ -932,7 +1115,7 @@ func (t *MongoDBTransport) saveCheckpoint(ctx context.Context) {
 
 	cp := &checkpoint{ResumeToken: token, Seq: seq, UpdatedAt: time.Now().UTC()}
 
-	if err := t.store.SaveCheckpoint(ctx, cp); err != nil && t.logger != nil {
+	if err := st.SaveCheckpoint(ctx, cp); err != nil && t.logger != nil {
 		t.logger.LogAttrs(ctx, slog.LevelWarn, "Unable to save checkpoint", slog.Any("error", err))
 	}
 }
@@ -949,7 +1132,14 @@ func (t *MongoDBTransport) cleanupLoop() {
 		case <-t.ctx.Done():
 			return
 		case <-ticker.C:
-			if err := t.store.Cleanup(t.ctx, t.retention); err != nil && t.logger != nil {
+			// Skip while MongoDB is not connected; the consumer reports the
+			// connection failure, and the next tick retries.
+			st := t.currentStore()
+			if st == nil {
+				continue
+			}
+
+			if err := st.Cleanup(t.ctx, t.retention); err != nil && t.logger != nil {
 				t.logger.LogAttrs(t.ctx, slog.LevelWarn, "Retention cleanup failed", slog.Any("error", err))
 			}
 		}

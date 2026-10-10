@@ -290,12 +290,12 @@ func TestGapIsBackfilledInOrder(t *testing.T) {
 
 	// The consumer sees only the third event. The two missing events must be
 	// backfilled from the durable collection, in order, before it.
-	require.NoError(t, tr.apply(docs[2]))
+	require.NoError(t, tr.apply(st, docs[2]))
 
 	assert.Equal(t, []string{"1", "2", "3"}, readIDs(t, s, 3))
 
 	// A redelivered event is dropped.
-	require.NoError(t, tr.apply(docs[2]))
+	require.NoError(t, tr.apply(st, docs[2]))
 	assertNoEvent(t, s)
 }
 
@@ -322,11 +322,11 @@ func TestLaggingHubDoesNotRedeliver(t *testing.T) {
 	require.NoError(t, tr.AddSubscriber(ctx, s))
 	assert.Equal(t, int64(5), tr.liveFloors[s])
 
-	require.NoError(t, tr.apply(docs[3])) // sequence 4, below the floor
-	require.NoError(t, tr.apply(docs[4])) // sequence 5, at the floor
+	require.NoError(t, tr.apply(st, docs[3])) // sequence 4, below the floor
+	require.NoError(t, tr.apply(st, docs[4])) // sequence 5, at the floor
 	assertNoEvent(t, s)
 
-	require.NoError(t, tr.apply(docs[5])) // sequence 6, above the floor
+	require.NoError(t, tr.apply(st, docs[5])) // sequence 6, above the floor
 	assert.Equal(t, []string{"6"}, readIDs(t, s, 1))
 }
 
@@ -349,7 +349,7 @@ func TestUnfillableGapIsReported(t *testing.T) {
 	// cannot be filled from the durable collection.
 	st.docs = st.docs[2:]
 
-	err := tr.apply(docs[2])
+	err := tr.apply(st, docs[2])
 	require.ErrorIs(t, err, errGapExpired)
 
 	// The watermark must not advance past the missing events.
@@ -370,7 +370,7 @@ func TestRecoverGapDisconnectsSubscribers(t *testing.T) {
 	s := newTestSubscriber(mercure.EarliestLastEventID, []string{testTopic}, nil)
 	require.NoError(t, tr.AddSubscriber(ctx, s))
 
-	require.NoError(t, tr.recoverGap())
+	require.NoError(t, tr.recoverGap(st))
 
 	// The watermark fast forwards to the latest event and the subscriber is
 	// disconnected, so the client reconnects and replays from its last event ID.
@@ -461,7 +461,7 @@ func TestReplayRangeWithRetentionHoleAnswersEarliest(t *testing.T) {
 	// The requested position and the events that follow it were removed, so the
 	// range is not contiguous: the subscriber is answered earliest instead of
 	// being served a suffix with a hole.
-	require.NoError(t, tr.replayRange(ctx, s, 2, 5, "2", true))
+	require.NoError(t, tr.replayRange(ctx, st, s, 2, 5, "2", true))
 	assertNoEvent(t, s)
 }
 

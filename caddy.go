@@ -55,7 +55,9 @@ func (m *MongoDB) GetTransport() mercure.Transport { //nolint:ireturn
 	return m.transport
 }
 
-// Provision builds or reuses the transport.
+// Provision builds or reuses the transport. It does not wait for MongoDB: the
+// transport connects on first use, so a hub starts even when the database is
+// not ready yet.
 func (m *MongoDB) Provision(ctx caddy.Context) error {
 	if m.URI == "" {
 		return fmt.Errorf("the mongodb transport requires a connection string, set the \"uri\" directive or the MERCURE_MONGODB_URI environment variable")
@@ -67,15 +69,11 @@ func (m *MongoDB) Provision(ctx caddy.Context) error {
 	cfg := m.effectiveConfig(hubName)
 
 	destructor, _, err := mercurecaddy.TransportUsagePool.LoadOrNew(m.transportKey, func() (caddy.Destructor, error) {
-		t, err := NewMongoDBTransport(
-			ctx,
+		t := NewMongoDBTransport(
 			mercure.NewSubscriberList(ctx.Value(mercurecaddy.SubscriberListCacheSizeContextKey).(int)), //nolint:forcetypeassert
 			ctx.Slogger(),
 			cfg,
 		)
-		if err != nil {
-			return nil, err
-		}
 
 		return mercurecaddy.TransportDestructor[*MongoDBTransport]{Transport: t}, nil
 	})

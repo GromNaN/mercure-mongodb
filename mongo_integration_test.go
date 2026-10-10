@@ -43,16 +43,13 @@ func dropDatabase(t *testing.T, uri, database string) {
 func newIntegrationTransport(t *testing.T, uri, database, hubName string) *MongoDBTransport {
 	t.Helper()
 
-	tr, err := NewMongoDBTransport(context.Background(), mercure.NewSubscriberList(0), testLogger(), Config{
+	return NewMongoDBTransport(mercure.NewSubscriberList(0), testLogger(), Config{
 		URI:         uri,
 		Database:    database,
 		Collection:  "updates",
 		Checkpoints: "checkpoints",
 		HubName:     hubName,
 	})
-	require.NoError(t, err)
-
-	return tr
 }
 
 func TestIntegrationReplay(t *testing.T) {
