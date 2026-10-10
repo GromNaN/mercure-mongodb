@@ -6,16 +6,22 @@
 
 A [MongoDB](https://www.mongodb.com/) transport for the [Mercure](https://mercure.rocks) hub.
 
-It stores the update history in MongoDB and uses a MongoDB change stream to
-synchronize hub instances. MongoDB is the only shared service: there is no
-Redis, no Kafka, and no other broker.
+Did you know Mercure is modular? Mercure pushes live events to clients over
+Server-Sent Events. The open source hub works well on its own: it keeps the
+history in memory, which is simple and fast. But memory does not survive a
+restart, and a single machine caps how many clients you can serve.
 
-- Durable history. A client that reconnects with `Last-Event-ID` is replayed
+For resilience and scalability, you change one part: the transport. This
+transport stores the update history in MongoDB and shares it between hub
+instances through a MongoDB change stream. MongoDB is the only shared service:
+there is no Redis, no Kafka, and no other broker.
+
+- **Durable history.** A client that reconnects with `Last-Event-ID` is replayed
   from MongoDB, even if it lands on another hub instance.
-- Multi instance by default. Every hub reads the same change stream, so a
+- **Multi instance by default.** Every hub reads the same change stream, so a
   publish on one instance reaches subscribers on all of them.
-- One dependency to operate. The same MongoDB deployment serves storage and fan
-  out.
+- **One dependency to operate.** The same MongoDB deployment serves storage and
+  fan out.
 
 The transport plugs into the standard Mercure hub. The protocol, the HTTP
 endpoints, JWT authorization and the SSE server stay in Mercure. This project
@@ -23,17 +29,7 @@ only provides storage and cross instance synchronization.
 
 ## Table of contents
 
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Quick start](#quick-start)
-- [Docker](#docker)
-- [Configuration](#configuration)
-- [Guarantees and limits](#guarantees-and-limits)
-- [Multi instance](#multi-instance)
-- [Production notes](#production-notes)
-- [Load testing](#load-testing)
-- [Development](#development)
-- [License](#license)
+[How it works](#how-it-works) • [Requirements](#requirements) • [Quick start](#quick-start) • [Docker](#docker) • [Configuration](#configuration) • [Guarantees and limits](#guarantees-and-limits) • [Multi instance](#multi-instance) • [When to use Mercure Enterprise](#when-to-use-mercure-enterprise) • [Production notes](#production-notes) • [Load testing](#load-testing) • [Development](#development) • [License](#license)
 
 ## How it works
 
@@ -44,19 +40,18 @@ there is a single ordered delivery path and no duplicate.
 
 ![Architecture: a publisher posts to any Mercure hub. Each hub inserts one event document into a MongoDB replica set. Every hub reads the collection through a change stream, so an update published on any hub reaches every subscriber on every hub over SSE](docs/architecture.svg)
 
-The internal cursor is a gapless sequence stored as `_id`. A hub keeps an
-applied watermark and, for each subscriber, a live floor. Replay sends history
-up to the snapshot, live delivery starts above the floor, and the change stream
-consumer fills any gap from the durable collection. This gives a clean
-replay/live boundary with no gap and no duplicate. See
+On a reconnect, a hub replays the history from MongoDB, then continues with live
+delivery. The change stream carries a resume token, so a hub that restarts picks
+up where it stopped. If the stream ever skips an event, the hub reads the
+missing range from the collection before it delivers the next one, so a
+subscriber never sees a gap or a duplicate. See
 [`docs/adr/0001-mongodb-transport.md`](docs/adr/0001-mongodb-transport.md) for
 the full design and its trade-offs.
 
 ## Requirements
 
-- A MongoDB replica set. A standalone server cannot serve change streams, and a
-  sharded cluster does not enforce the global uniqueness of `_id` that the
-  gapless sequence relies on, so the transport refuses to start on both.
+- A MongoDB replica set. Change streams need a replica set, so a standalone
+  server is refused at startup. A sharded cluster is not supported either.
 - A Caddy build that includes the Mercure handler and this transport.
 
 Supported versions:
@@ -274,27 +269,15 @@ transport never logs the connection string.
   store the same update twice. Duplicates are possible; gaps are not.
 - **`Last-Event-ID`.** A reconnect replays the updates published after the given
   ID. When the ID is unknown, or was removed by retention, the hub answers with
-  `earliest` so the client can reload its state. This matches the Bolt
-  transport.
-- **Repeated visible IDs.** A publisher retry can store the same update twice
-  under two sequences and one visible ID. The hub resolves the ID to its
-  earliest occurrence still in the retention window, and answers `earliest`
-  instead of replaying a suffix that would skip updates. The `seen_ids`
-  collection records the IDs that still have an occurrence in the window, so it
-  stays bounded: a marker is dropped once the ID leaves the window, and a reuse
-  after that is treated as a new ID.
+  `earliest` so the client can reload its state.
 - **Change stream dependency.** Delivery needs a healthy change stream. The
   transport reports its health through `Ready` and `Live`, and reconnects with
   exponential backoff. A hub that loses the stream catches up from the durable
   collection before it reports itself ready.
 - **Count-based retention only.** Retention keeps the newest N updates. There is
-  no age-based expiry, because a TTL index could restart the internal sequence
-  and break the replay/live boundary. Use count-based `retention` instead.
-- **Retention can outrun a subscriber.** If a subscriber lags behind further
-  than the retention window, the updates it still needs are deleted. The hub
-  detects the unfillable gap, disconnects the subscriber and fast forwards, so
-  the client reconnects and replays what remains. Size `retention` above the
-  worst expected subscriber lag.
+  no age-based expiry. Size `retention` above the worst expected subscriber lag,
+  because a subscriber that falls further behind than the window is disconnected
+  and fast forwarded, so the client reconnects and replays what remains.
 - **Do not drop the collection while hubs run.** Dropping or renaming the
   `updates` collection restarts the internal sequence. The transport logs an
   error and resets its watermark. This is a destructive operator action.
@@ -318,38 +301,56 @@ Give each instance a distinct Caddy `name` so their checkpoints do not collide.
 Two instances with the same name share one checkpoint, which only affects resume
 after a restart, not correctness.
 
-For publishing, prefer a single writer. The internal sequence is one counter, so
-two instances that publish at the same time collide on the next value and retry.
-The transport resolves this correctly, but it is more efficient to elect one
-instance and send every publish to it. The writer is only a sequence allocator:
-it holds no ordering state, so a failover is safe, and if two instances publish
-during the handover the collisions are absorbed. Delivery, replay and
-`Last-Event-ID` are not affected, because they run on the change stream on every
-instance.
+For publishing, prefer a single writer. Two instances that publish at the same
+time collide on the next sequence value and retry. The transport resolves this
+correctly, but it is more efficient to elect one instance and send every publish
+to it. The writer is only a sequence allocator, so a failover is safe. Delivery,
+replay and `Last-Event-ID` are not affected. See the ADR for the trade-off.
 
-Avoid placing writers in different regions. The collision window grows with the
-insert latency, and the sequence head is unique, so regional writers collide
-over the slowest link.
+## When to use Mercure Enterprise
+
+This transport covers hubs backed by MongoDB. Mercure also ships
+[Enterprise transports](https://mercure.rocks/pricing) on Redis/Valkey,
+PostgreSQL, Kafka and Pulsar. They are not better in general, but they fit
+better in a few cases:
+
+- **Cluster-wide subscriptions.** The Redis/Valkey transport shares the
+  subscriber list across instances, so the subscription API reports presence
+  for the whole cluster. Here, `GetSubscribers` reports only the subscribers
+  connected to the local instance.
+- **A backend you already run.** If your team already operates PostgreSQL,
+  Kafka, Pulsar or Redis and does not run MongoDB, an Enterprise transport
+  avoids adding a new stateful service. The "one dependency to operate" claim
+  above only holds when that dependency is MongoDB.
+- **Broker managed retention.** Retention here is count based only. The Kafka,
+  Pulsar and Redis/Valkey transports delegate retention to the broker, which
+  can match an existing time or size based data policy.
+- **Queryable history.** The PostgreSQL transport keeps history in a table you
+  can query for diagnostics and analytics.
+- **Commercial support.** Mercure Enterprise and Mercure Cloud include
+  maintainer support and response time commitments. This project is AGPL 3.0,
+  community maintained, with no SLA.
+
+If none of these applies, this transport is a good fit: durable history, a
+global gapless order, multi-instance delivery and replay, with MongoDB as the
+only shared service.
 
 ## Production notes
 
 - **Write concern.** The transport writes with `w:majority` and reads from the
   primary, so the internal sequence stays gapless across a failover.
 - **Minimal MongoDB permissions.** The transport needs `readWrite` on the
-  database that holds the events and checkpoints collections, and `read` on the
-  `admin` database to detect a standalone deployment. Grant nothing more.
-- **Indexes.** The transport creates a compound index on
-  `{mercure_id: 1, _id: 1}` to resolve `Last-Event-ID` lookups. The default
-  `_id` index serves replay, retention and cursor order.
+  database that holds the events and checkpoints collections. Grant nothing
+  more.
+- **Indexes.** The transport creates its indexes at startup. The `_id` index
+  serves replay, retention and cursor order.
 - **Oplog window.** A longer oplog lets a hub resume a change stream after a
   longer outage without a full catch up. Size the oplog for the outage you want
   to tolerate.
-- **Backups.** The `updates` collection is the durable history. The `seen_ids`
-  collection is correctness-critical state too: it records whether a visible ID
-  is new, which decides between a replay and an `earliest` answer. Back up both,
-  and the `checkpoints` collection, with your usual MongoDB tooling. Restoring
-  only `updates` loses the ID markers, so a reused ID can be mistaken for a new
-  one.
+- **Backups.** Back up the `updates`, `seen_ids` and `checkpoints` collections
+  with your usual MongoDB tooling. The `updates` collection is the durable
+  history, and `seen_ids` decides whether a visible ID is new, so restoring only
+  `updates` can make a reused ID look new.
 - **Reverse proxy.** Configure your proxy to keep SSE connections open: disable
   response buffering and raise the read timeout above the hub heartbeat.
 - **Observability.** The transport exposes `Ready`, `Live` and `Lag`. A hub that
