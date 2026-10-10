@@ -26,6 +26,7 @@ only provides storage and cross instance synchronization.
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Docker](#docker)
 - [Configuration](#configuration)
 - [Guarantees and limits](#guarantees-and-limits)
 - [Multi instance](#multi-instance)
@@ -103,11 +104,21 @@ http://localhost:3000 {
 			retention 10000
 		}
 
-		publisher_jwt {$MERCURE_PUBLISHER_JWT_KEY} HS256
-		subscriber_jwt {$MERCURE_SUBSCRIBER_JWT_KEY} HS256
+		issuer http://localhost:3000 {
+			publisher {
+				jwt {env.MERCURE_PUBLISHER_JWT_KEY} HS256
+			}
+			subscriber {
+				jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} HS256
+			}
+		}
 	}
 }
 ```
+
+The `issuer` block declares a trusted token issuer and its verification
+keys, as RFC 9068 requires. The hub serves the endpoint at
+`/.well-known/mercure`.
 
 See [`examples/Caddyfile`](examples/Caddyfile) for the full file.
 
@@ -124,44 +135,100 @@ The hub is now available at `http://localhost:3000`.
 
 ### 5. Publish and subscribe
 
-Mint two tokens for the development keys. The example uses a short Python
-snippet, because the JSON Web Token format is standard.
+Mint two tokens for the development keys with the `mercure-token` command of
+the hub binary. It mints an RFC 9068 access token carrying the RFC 9396
+`authorization_details` claim.
 
 ```console
-mint() {
-  python3 - "$1" "$2" <<'PY'
-import base64, hashlib, hmac, json, sys
-key, claim = sys.argv[1].encode(), sys.argv[2]
-b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-body = b64(json.dumps({"mercure": json.loads(claim)}, separators=(",", ":")).encode())
-sig = b64(hmac.new(key, f"{head}.{body}".encode(), hashlib.sha256).digest())
-print(f"{head}.{body}.{sig}")
-PY
-}
+ISSUER='http://localhost:3000'
+AUDIENCE='http://localhost:3000/.well-known/mercure'
 
-PUBLISHER_JWT=$(mint "$MERCURE_PUBLISHER_JWT_KEY" '{"publish":["*"]}')
-SUBSCRIBER_JWT=$(mint "$MERCURE_SUBSCRIBER_JWT_KEY" '{"subscribe":["*"]}')
+PUBLISHER_JWT=$(printf '%s' "$MERCURE_PUBLISHER_JWT_KEY" | ./caddy mercure-token \
+  --iss "$ISSUER" --aud "$AUDIENCE" --key @- --publish '*')
+SUBSCRIBER_JWT=$(printf '%s' "$MERCURE_SUBSCRIBER_JWT_KEY" | ./caddy mercure-token \
+  --iss "$ISSUER" --aud "$AUDIENCE" --key @- --subscribe '*')
 ```
 
-Subscribe in one terminal:
+Subscribe in one terminal. The `match` parameter does an exact-match
+subscription on the topic:
 
 ```console
-curl -N http://localhost:3000/hub \
-  -H "Authorization: Bearer $SUBSCRIBER_JWT" \
-  --get --data-urlencode 'topic=https://example.com/books/1'
+curl -N 'http://localhost:3000/.well-known/mercure?match=https%3A%2F%2Fexample.com%2Fbooks%2F1' \
+  -H "Authorization: Bearer $SUBSCRIBER_JWT"
 ```
 
 Publish in another:
 
 ```console
-curl -X POST http://localhost:3000/hub \
+curl -X POST http://localhost:3000/.well-known/mercure \
   -H "Authorization: Bearer $PUBLISHER_JWT" \
   --data-urlencode 'topic=https://example.com/books/1' \
   --data-urlencode 'data=hello'
 ```
 
 The subscriber receives the update through MongoDB.
+
+## Docker
+
+Prebuilt images are published to the GitHub Container Registry on every version
+tag: `ghcr.io/gromnan/mercure-mongodb`. They bundle the Mercure hub and this
+transport, so there is nothing to build. Each release publishes the version tag
+and `latest`.
+
+The image runs the default [`Caddyfile`](Caddyfile), which reads its
+configuration from the environment.
+
+| Variable                     | Default              | Description                                           |
+| ---------------------------- | -------------------- | ----------------------------------------------------- |
+| `MERCURE_MONGODB_URI`        |                      | MongoDB connection string, on a replica set. Required. |
+| `MERCURE_PUBLISHER_JWT_KEY`  |                      | Publisher JWT key. Required.                          |
+| `MERCURE_SUBSCRIBER_JWT_KEY` |                      | Subscriber JWT key. Required.                         |
+| `SERVER_NAME`                | `localhost`          | Public address the hub listens on.                    |
+| `MERCURE_TRUSTED_ISSUERS`    | `https://localhost`  | Trusted token issuer identifier (the token `iss`).    |
+| `MERCURE_MONGODB_DATABASE`   | `mercure`            | Database that holds the events and checkpoints.       |
+| `MERCURE_MONGODB_COLLECTION` | `updates`            | Collection of update documents.                       |
+| `MERCURE_MONGODB_RETENTION`  | `10000`              | Number of newest updates kept. `0` keeps everything.  |
+| `MERCURE_PUBLISHER_JWT_ALG`  | `HS256`              | Publisher JWT algorithm.                              |
+| `MERCURE_SUBSCRIBER_JWT_ALG` | `HS256`              | Subscriber JWT algorithm.                             |
+
+Start a MongoDB replica set and the hub on the same network:
+
+```console
+docker network create mercure
+docker run -d --name mongodb --network mercure \
+  mongodb/mongodb-atlas-local:latest
+docker run -d --name mercure --network mercure -p 3000:3000 \
+  -e SERVER_NAME=:3000 \
+  -e MERCURE_TRUSTED_ISSUERS='http://localhost:3000' \
+  -e MERCURE_MONGODB_URI='mongodb://mongodb:27017/?directConnection=true' \
+  -e MERCURE_PUBLISHER_JWT_KEY='change-me' \
+  -e MERCURE_SUBSCRIBER_JWT_KEY='change-me' \
+  ghcr.io/gromnan/mercure-mongodb:latest
+```
+
+The hub is available at `http://localhost:3000`, and the endpoint is
+`/.well-known/mercure`. Mint tokens with the `mercure-token` command inside the
+image:
+
+```console
+PUBLISHER_JWT=$(printf '%s' 'change-me' | docker exec -i mercure caddy mercure-token \
+  --iss 'http://localhost:3000' --aud 'http://localhost:3000/.well-known/mercure' \
+  --key @- --publish '*')
+SUBSCRIBER_JWT=$(printf '%s' 'change-me' | docker exec -i mercure caddy mercure-token \
+  --iss 'http://localhost:3000' --aud 'http://localhost:3000/.well-known/mercure' \
+  --key @- --subscribe '*')
+```
+
+Then publish and subscribe as in the [quick start](#quick-start).
+
+The token `iss` must match `MERCURE_TRUSTED_ISSUERS`, and its `aud` must
+contain the resource identifier: the public URL the client contacted, plus
+`/.well-known/mercure`. When the hub sits behind a reverse proxy, set
+`MERCURE_TRUSTED_ISSUERS` to the issuer your application mints tokens with,
+and, for a stable audience across domains, pin it with the
+`resource_identifier` directive through `MERCURE_EXTRA_DIRECTIVES`. See
+[`Caddyfile`](Caddyfile) for the full default configuration, and mount your own
+file at `/etc/caddy/Caddyfile` to replace it.
 
 ## Configuration
 
@@ -295,7 +362,7 @@ publish to client latency.
 
 ```console
 go run ./load \
-  -hub http://localhost:3000/hub \
+  -hub http://localhost:3000/.well-known/mercure \
   -publish-token "$PUBLISHER_JWT" \
   -subscribe-token "$SUBSCRIBER_JWT" \
   -clients 2000 -messages 2000

@@ -1,0 +1,83 @@
+version: 2
+
+project_name: mercure-mongodb
+
+before:
+  hooks:
+    - go mod tidy
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github-native
+
+release:
+  prerelease: auto
+  draft: true
+
+env:
+  - CGO_ENABLED=0
+
+builds:
+  - id: caddy
+    dir: caddy/mercure
+    binary: mercure-mongodb
+    ldflags:
+      - -X 'github.com/caddyserver/caddy/v2/modules/caddyhttp.ServerHeader=Mercure.rocks Caddy'
+      - -X 'github.com/caddyserver/caddy/v2.CustomVersion=Mercure.rocks {{ .Version }} Caddy'
+      - -X 'github.com/caddyserver/caddy/v2.CustomBinaryName=mercure-mongodb'
+    # The same build tags as the Mercure hub, so the image accepts the mercure
+    # JWT claim, the topic query parameter and the other deprecated options.
+    tags:
+      - deprecated_transport
+      - deprecated_topic
+      - deprecated_claim
+      - nobadger
+      - nomysql
+      - nopgx
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - ids:
+      - caddy
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    files:
+      - LICENSE
+      - README.md
+      - Caddyfile
+
+dockers_v2:
+  - ids:
+      - caddy
+    images:
+      - ghcr.io/gromnan/mercure-mongodb
+    tags:
+      # The version tag, plus latest. latest is suppressed on prereleases so a
+      # prerelease cut does not move :latest off the stable line.
+      - "{{ .Tag }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    # Otherwise inherited from the Caddy base image.
+    labels:
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .Date }}"
+    extra_files:
+      - Caddyfile

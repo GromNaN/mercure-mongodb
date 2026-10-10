@@ -31,6 +31,10 @@ const (
 	// reconnect backoff bounds for the change stream consumer.
 	reconnectMin = 250 * time.Millisecond
 	reconnectMax = 30 * time.Second
+
+	// closeTimeout bounds the best-effort checkpoint and the MongoDB disconnect
+	// when the transport shuts down.
+	closeTimeout = 5 * time.Second
 )
 
 // errInvalidate signals that the change stream sent an invalidate event, which
@@ -528,10 +532,18 @@ func (t *MongoDBTransport) Close(ctx context.Context) error {
 			return true
 		})
 
-		t.saveCheckpoint(ctx)
+		// The caller's context is unusable for cleanup: it can already be
+		// canceled, and during a Caddy shutdown caddy.ActiveContext carries no
+		// embedded context at all, so the MongoDB driver panics when it reads a
+		// value or a deadline. Use a fresh context, bounded by its own timeout,
+		// so the checkpoint and the disconnect still run.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancel()
 
-		if err := t.store.Close(ctx); err != nil && t.logger != nil {
-			t.logger.LogAttrs(ctx, slog.LevelError, "Unable to close MongoDB", slog.Any("error", err))
+		t.saveCheckpoint(cleanupCtx)
+
+		if err := t.store.Close(cleanupCtx); err != nil && t.logger != nil {
+			t.logger.LogAttrs(cleanupCtx, slog.LevelError, "Unable to close MongoDB", slog.Any("error", err))
 		}
 	})
 

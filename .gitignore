@@ -3,6 +3,8 @@
 
 # Build output.
 /mercure-mongodb
+/linux/
+/dist/
 *.test
 *.out
 
