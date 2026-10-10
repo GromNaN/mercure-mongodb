@@ -247,6 +247,26 @@ is down, and it reconnects with exponential backoff. The README documents this.
 `GetSubscribers` reports only the subscribers connected to this hub instance,
 because the subscriber list is local. This matches the Bolt transport.
 
+**Writer concentration.** The sequence is a single logical counter, so allocation
+is a serialization point by construction. Adding writer hubs does not
+parallelize it, it only adds collisions. A single writer hub has no collisions
+and the shortest publish path. Spreading publishes across hubs is still correct,
+because the unique index resolves every collision, but each collision costs an
+extra primary read and an extra insert attempt, and a synchronized burst of
+writers is the worst case.
+
+Concentrating the writes on one elected hub is therefore the efficient
+deployment, but it trades write availability for write throughput. The writer
+becomes a single point of failure for publishing, so it must be elected or
+failed over. Delivery, replay and subscriptions are unaffected, because they run
+on the change stream on every hub and not on the writer. The writer is only a
+sequence allocator, it holds no ordering state, so a failover is safe: if two
+hubs publish during the handover, the collisions are absorbed, not corrupted.
+
+Avoid placing writers in different regions. The collision window grows with the
+insert latency, so each collision costs an inter-region round trip, and one
+writer per region does not help because the sequence head is still unique.
+
 ### 7. Replay/live coherence
 
 `AddSubscriber` runs as follows:

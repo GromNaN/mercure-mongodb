@@ -237,6 +237,19 @@ Give each instance a distinct Caddy `name` so their checkpoints do not collide.
 Two instances with the same name share one checkpoint, which only affects resume
 after a restart, not correctness.
 
+For publishing, prefer a single writer. The internal sequence is one counter, so
+two instances that publish at the same time collide on the next value and retry.
+The transport resolves this correctly, but it is more efficient to elect one
+instance and send every publish to it. The writer is only a sequence allocator:
+it holds no ordering state, so a failover is safe, and if two instances publish
+during the handover the collisions are absorbed. Delivery, replay and
+`Last-Event-ID` are not affected, because they run on the change stream on every
+instance.
+
+Avoid placing writers in different regions. The collision window grows with the
+insert latency, and the sequence head is unique, so regional writers collide
+over the slowest link.
+
 ## Production notes
 
 - **Write concern.** The transport writes with `w:majority` and reads from the
