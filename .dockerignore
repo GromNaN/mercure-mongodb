@@ -1,0 +1,9 @@
+# Only the files the Dockerfile copies take part in the build context: the
+# prebuilt hub binary under ${TARGETPLATFORM}/, the Caddyfile and the license
+# texts. Everything else stays out, so the context is small and a stray local
+# file cannot end up in the image.
+*
+!Caddyfile
+!LICENSE
+!LICENSES
+!linux

@@ -2,7 +2,7 @@
 #
 # Smoke test a mercure-mongodb container image.
 #
-# Starts the hub, waits for it to report ready, then checks a full
+# Starts the hub, waits for it to serve its public endpoint, then checks a full
 # publish/subscribe round trip: a subscriber opens an SSE stream and the update
 # published on the same topic must reach it through MongoDB.
 #
@@ -30,9 +30,20 @@ topic='https://example.com/books/1'
 
 sse_out=$(mktemp)
 sse_headers=$(mktemp)
+subscriber=
 
 cleanup() {
-	docker logs "$container" >&2 || true
+	status=$?
+	# Kill the SSE subscriber first, so no curl keeps running after an early
+	# exit and no stream is left open against the container that is about to go.
+	if [ -n "$subscriber" ]; then
+		kill "$subscriber" 2>/dev/null || true
+		wait "$subscriber" 2>/dev/null || true
+	fi
+	# Dump the hub logs only on failure: they explain what went wrong.
+	if [ "$status" -ne 0 ]; then
+		docker logs "$container" >&2 || true
+	fi
 	docker rm -f "$container" >/dev/null 2>&1 || true
 	rm -f "$sse_out" "$sse_headers"
 }
@@ -47,6 +58,10 @@ docker run -d --name "$container" --network host \
 	-e MERCURE_SUBSCRIBER_JWT_KEY="$key" \
 	"$image"
 
+# The admin health endpoint reports ready while Caddy is still provisioning the
+# mercure handler, before the public listener accepts connections. Wait for the
+# health endpoint, then wait for the public endpoint to answer, so the test
+# never subscribes against a socket that is not open yet.
 echo "waiting for the hub to report ready"
 ready=false
 for _ in $(seq 1 30); do
@@ -58,6 +73,22 @@ for _ in $(seq 1 30); do
 done
 if [ "$ready" != true ]; then
 	echo "the hub did not become ready" >&2
+	exit 1
+fi
+
+echo "waiting for the hub to accept connections on ${audience}"
+listening=false
+for _ in $(seq 1 30); do
+	# Any HTTP status means the listener is up, including the 401 that answers a
+	# request without a token. A refused connection makes curl fail instead.
+	if curl -sS -o /dev/null --max-time 2 "$audience" 2>/dev/null; then
+		listening=true
+		break
+	fi
+	sleep 1
+done
+if [ "$listening" != true ]; then
+	echo "the hub did not accept connections on ${audience}" >&2
 	exit 1
 fi
 
@@ -74,7 +105,7 @@ echo "opening an SSE subscription"
 # Dump the response headers so the test can wait for the 200 that marks the
 # subscription as established. Publishing before that point would let the
 # subscriber miss the live update on a slow runner.
-curl -sN --max-time 30 -D "$sse_headers" --get \
+curl -sN --max-time 60 -D "$sse_headers" --get \
 	--data-urlencode "match=$topic" \
 	"$audience" \
 	-H "Authorization: Bearer $subscriber_jwt" >"$sse_out" &
@@ -99,11 +130,23 @@ curl -fsS -X POST "$audience" \
 	--data-urlencode "topic=$topic" \
 	--data-urlencode 'data=hello' >/dev/null
 
-sleep 1
+# Poll for the update instead of sleeping a fixed time. The update crosses
+# MongoDB and the change stream, so the delay is not deterministic on a busy
+# runner.
+received=false
+for _ in $(seq 1 30); do
+	if grep -q 'data: hello' "$sse_out"; then
+		received=true
+		break
+	fi
+	sleep 1
+done
+
 kill "$subscriber" 2>/dev/null || true
 wait "$subscriber" 2>/dev/null || true
+subscriber=
 
-if ! grep -q 'data: hello' "$sse_out"; then
+if [ "$received" != true ]; then
 	echo "the subscriber did not receive the update" >&2
 	cat "$sse_out" >&2
 	exit 1

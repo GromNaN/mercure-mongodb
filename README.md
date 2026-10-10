@@ -192,12 +192,16 @@ configuration from the environment.
 | `MERCURE_PUBLISHER_JWT_ALG`  | `HS256`              | Publisher JWT algorithm.                              |
 | `MERCURE_SUBSCRIBER_JWT_ALG` | `HS256`              | Subscriber JWT algorithm.                             |
 
-Start a MongoDB replica set and the hub on the same network:
+Start a MongoDB replica set and the hub on the same network. Wait for MongoDB to
+finish initializing its replica set before you start the hub: the hub refuses to
+provision while the replica set is not ready.
 
 ```console
 docker network create mercure
 docker run -d --name mongodb --network mercure \
   mongodb/mongodb-atlas-local:latest
+# The image ships a healthcheck, so this returns once the replica set is ready.
+until [ "$(docker inspect -f '{{.State.Health.Status}}' mongodb)" = healthy ]; do sleep 1; done
 docker run -d --name mercure --network mercure -p 3000:3000 \
   -e SERVER_NAME=:3000 \
   -e MERCURE_TRUSTED_ISSUERS='http://localhost:3000' \
@@ -396,4 +400,8 @@ replica set, because change streams are not available on a standalone server.
 
 [MIT](LICENSE). This module is a separate work that plugs into the Mercure hub
 through its public transport interface. Mercure itself stays under
-AGPL-3.0-or-later.
+AGPL-3.0-or-later, and Caddy under Apache-2.0.
+
+The image and the release archives bundle all three works, so they carry all
+three license texts: [`LICENSE`](LICENSE) and the texts in
+[`LICENSES/`](LICENSES). Inside the image they are in `/licenses`.

@@ -3,8 +3,18 @@ HUB ?= http://localhost:3000/.well-known/mercure
 CLIENTS ?= 1000
 MESSAGES ?= 1000
 
+# The image targets Linux. Build the hub binary for the host architecture, so
+# the local image matches the machine. GoReleaser builds both amd64 and arm64
+# for a release.
+GOOS ?= linux
+GOARCH ?= $(shell go env GOARCH)
+TARGETPLATFORM ?= $(GOOS)/$(GOARCH)
+
 # Build tags for the hub binary and the container image, the same as the Mercure
-# hub release, so the image accepts the deprecated options.
+# hub release. The deprecated_* tags compile in the Mercure v0.x compatibility
+# mode, which only takes effect when a configuration sets
+# protocol_version_compatibility. The nobadger, nomysql and nopgx tags match the
+# upstream release build; Mercure v1.1.0 no longer reads them.
 HUB_TAGS ?= deprecated_transport,deprecated_topic,deprecated_claim,nobadger,nomysql,nopgx
 
 .PHONY: build build-hub docker test test-integration load fmt vet tidy
@@ -14,13 +24,13 @@ build:
 
 # Build the hub binary locally, with the Mercure handler and this transport.
 build-hub:
-	mkdir -p linux/amd64
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags '$(HUB_TAGS)' -o linux/amd64/mercure-mongodb ./caddy/mercure
+	mkdir -p $(TARGETPLATFORM)
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -tags '$(HUB_TAGS)' -o $(TARGETPLATFORM)/mercure-mongodb ./caddy/mercure
 
 # Build the container image. The Dockerfile expects the hub binary under the
 # target platform directory, the way GoReleaser lays it out.
 docker: build-hub
-	docker build --build-arg TARGETPLATFORM=linux/amd64 -t mercure-mongodb .
+	docker build --build-arg TARGETPLATFORM=$(TARGETPLATFORM) -t mercure-mongodb .
 
 # Unit tests. They run without MongoDB.
 test:
