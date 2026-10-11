@@ -307,15 +307,17 @@ flushed after history, in order.
 
 ### 8. MongoDB dependency
 
-The transport requires a replica set. `Provision` verifies that the deployment
-can serve change streams by opening one: a standalone server rejects the
-`$changeStream` stage, so the transport fails with an actionable error on one.
-A sharded cluster accepts the change stream, so it is not detected, but it is
-not supported: a sharded collection enforces the `_id` index per shard unless
-`_id` is the shard key, so two shards could accept the same sequence number and
-break the gapless sequence. The replica set requirement is documented for
-sharding rather than enforced at startup. Integration tests run against a
-replica set.
+The transport requires a replica set. Provisioning does not contact MongoDB: the
+connection is opened on first use, and the consumer retries it with backoff, so a
+hub starts even when MongoDB is unreachable. Verifying that the deployment can
+serve change streams happens at that point, by opening a stream: a standalone
+server rejects the `$changeStream` stage, so the transport reports an actionable
+error on one and keeps retrying. A sharded cluster accepts the change stream, so
+it is not detected, but it is not supported: a sharded collection enforces the
+`_id` index per shard unless `_id` is the shard key, so two shards could accept
+the same sequence number and break the gapless sequence. The replica set
+requirement is documented for sharding rather than enforced. Integration tests
+run against a replica set.
 
 ## Consequences
 

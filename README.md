@@ -51,7 +51,8 @@ the full design and its trade-offs.
 ## Requirements
 
 - A MongoDB replica set. Change streams need a replica set, so a standalone
-  server is refused at startup. A sharded cluster is not supported either.
+  server is rejected when the transport connects. A sharded cluster is not
+  supported either.
 - A Caddy build that includes the Mercure handler and this transport.
 
 Supported versions:
@@ -187,9 +188,16 @@ configuration from the environment.
 | `MERCURE_PUBLISHER_JWT_ALG`  | `HS256`              | Publisher JWT algorithm.                              |
 | `MERCURE_SUBSCRIBER_JWT_ALG` | `HS256`              | Subscriber JWT algorithm.                             |
 
-Start a MongoDB replica set and the hub on the same network. Wait for MongoDB to
-finish initializing its replica set before you start the hub: the hub refuses to
-provision while the replica set is not ready.
+Start a MongoDB replica set and the hub on the same network. The hub starts
+whether or not MongoDB is ready: it opens the connection on first use and retries
+with backoff, so it recovers on its own once the replica set finishes
+initializing.
+
+The image ships a healthcheck that reads `/mercure/health/ready` on the Caddy
+admin API, on `127.0.0.1:2019` by default. The hub answers 503 there until the
+change stream is up and MongoDB answers a ping, so the container reports
+unhealthy while MongoDB is unreachable, and the orchestrator keeps it out of
+rotation. Point a Kubernetes readiness probe at the same endpoint.
 
 ```console
 docker network create mercure
@@ -274,6 +282,14 @@ transport never logs the connection string.
   transport reports its health through `Ready` and `Live`, and reconnects with
   exponential backoff. A hub that loses the stream catches up from the durable
   collection before it reports itself ready.
+- **Startup tolerates an unreachable MongoDB.** Provisioning does not contact
+  MongoDB. The consumer opens the connection on first use and retries it with
+  backoff, so a hub that starts before MongoDB is ready, or while it is down,
+  starts anyway and connects on its own. A publish or a subscriber that arrives
+  during the outage fails, and the client retries. `Ready` reports not ready
+  until the change stream is up and MongoDB answers a ping, so a hub that
+  started without MongoDB stays out of rotation. A definitive failure, such as a
+  wrong password, is logged and retried, never reported as a startup error.
 - **Count-based retention only.** Retention keeps the newest N updates. There is
   no age-based expiry. Size `retention` above the worst expected subscriber lag,
   because a subscriber that falls further behind than the window is disconnected
@@ -342,8 +358,8 @@ only shared service.
 - **Minimal MongoDB permissions.** The transport needs `readWrite` on the
   database that holds the events and checkpoints collections. Grant nothing
   more.
-- **Indexes.** The transport creates its indexes at startup. The `_id` index
-  serves replay, retention and cursor order.
+- **Indexes.** The transport creates its indexes when it connects. The `_id`
+  index serves replay, retention and cursor order.
 - **Oplog window.** A longer oplog lets a hub resume a change stream after a
   longer outage without a full catch up. Size the oplog for the outage you want
   to tolerate.
@@ -353,12 +369,15 @@ only shared service.
   `updates` can make a reused ID look new.
 - **Reverse proxy.** Configure your proxy to keep SSE connections open: disable
   response buffering and raise the read timeout above the hub heartbeat.
-- **Observability.** The transport exposes `Ready`, `Live` and `Lag`. A hub that
-  reports not ready, or a growing lag, points to a change stream or MongoDB
-  problem.
-- **Troubleshooting.** If the hub refuses to start, check that the deployment is
-  a replica set and that `uri` is set. If clients stop receiving updates, check
-  the change stream health and the MongoDB logs.
+- **Observability.** The transport exposes `Ready`, `Live` and `Lag`. `Ready`
+  answers nil only when the change stream is connected and caught up and MongoDB
+  answers a ping. `Live` never fails on a MongoDB outage: a restart cannot fix
+  MongoDB, and it would restart every hub at once. A hub that reports not ready,
+  or a growing lag, points to a change stream or MongoDB problem.
+- **Troubleshooting.** A hub that starts but never reports ready logs the MongoDB
+  connection failure: check that the deployment is a replica set and that `uri`
+  is set. If clients stop receiving updates, check the change stream health and
+  the MongoDB logs.
 
 ## License
 

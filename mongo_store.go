@@ -62,26 +62,9 @@ type mongoConfig struct {
 // newMongoStore connects to MongoDB, verifies change stream support and creates
 // the required indexes.
 func newMongoStore(ctx context.Context, cfg mongoConfig) (*mongoStore, error) {
-	clientOpts := options.Client().
-		ApplyURI(cfg.URI).
-		SetConnectTimeout(cfg.ConnectTimeout).
-		SetServerSelectionTimeout(cfg.ConnectTimeout).
-		// Majority writes make a publish durable before Dispatch returns, and
-		// make the gapless sequence safe across a failover. Primary reads make
-		// the max sequence and the replay range reflect the latest commit.
-		SetWriteConcern(writeconcern.Majority()).
-		SetReadPreference(readpref.Primary()).
-		SetRetryWrites(true)
-
-	client, err := mongo.Connect(clientOpts)
+	client, err := connect(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to MongoDB: %w", err)
-	}
-
-	if err := client.Ping(ctx, nil); err != nil {
-		_ = client.Disconnect(context.Background())
-
-		return nil, fmt.Errorf("pinging MongoDB: %w", err)
+		return nil, err
 	}
 
 	s := &mongoStore{
@@ -119,13 +102,64 @@ func newMongoStore(ctx context.Context, cfg mongoConfig) (*mongoStore, error) {
 	return s, nil
 }
 
+// mongoOpener connects to MongoDB and opens the store. Each call opens a new
+// client, so a failed attempt leaves nothing behind and the next one starts
+// from a clean state. The transport retries the calls with backoff.
+type mongoOpener struct {
+	cfg mongoConfig
+}
+
+func (o *mongoOpener) open(ctx context.Context) (store, error) {
+	s, err := newMongoStore(ctx, o.cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+// connect opens the client and waits for MongoDB to answer the first ping. It
+// makes a single attempt: the caller retries, and each retry opens a fresh
+// server selection window.
+//
+// The driver retries its own heartbeats, but only for the duration of the server
+// selection window of a single operation, and Ping is not a retryable read: a
+// server that stalls for longer than ConnectTimeout fails the operation for
+// good. A new attempt costs nothing once the driver's background monitor has
+// reconnected.
+func connect(ctx context.Context, cfg mongoConfig) (*mongo.Client, error) {
+	clientOpts := options.Client().
+		ApplyURI(cfg.URI).
+		SetConnectTimeout(cfg.ConnectTimeout).
+		SetServerSelectionTimeout(cfg.ConnectTimeout).
+		// Majority writes make a publish durable before Dispatch returns, and
+		// make the gapless sequence safe across a failover. Primary reads make
+		// the max sequence and the replay range reflect the latest commit.
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadPreference(readpref.Primary()).
+		SetRetryWrites(true)
+
+	client, err := mongo.Connect(clientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to MongoDB: %w", err)
+	}
+
+	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(context.Background())
+
+		return nil, fmt.Errorf("pinging MongoDB: %w", err)
+	}
+
+	return client, nil
+}
+
 // checkChangeStreamSupport verifies that the deployment can serve change
 // streams by opening one and closing it. A standalone server rejects the
-// $changeStream stage, so the transport refuses to start on one. A sharded
-// cluster accepts the stream, so it is not detected here, but it is not
-// supported: the gapless sequence relies on the global uniqueness of _id,
-// which a sharded collection only enforces per shard unless _id is the shard
-// key.
+// $changeStream stage, so the transport reports an actionable error on one and
+// keeps retrying. A sharded cluster accepts the stream, so it is not detected
+// here, but it is not supported: the gapless sequence relies on the global
+// uniqueness of _id, which a sharded collection only enforces per shard unless
+// _id is the shard key.
 func (s *mongoStore) checkChangeStreamSupport(ctx context.Context) error {
 	stream, err := s.Watch(ctx, nil)
 	if err != nil {
