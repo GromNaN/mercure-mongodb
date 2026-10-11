@@ -148,11 +148,41 @@ func TestOperationsFailWhileMongoDBIsUnreachable(t *testing.T) {
 	s := newTestSubscriber(mercure.EarliestLastEventID, []string{testTopic}, nil)
 	require.ErrorIs(t, tr.AddSubscriber(t.Context(), s), errUnreachable)
 
-	// Nothing is connected, so the health checks report it.
+	// Nothing is connected, so readiness reports it. Liveness stays ok: the
+	// consumer keeps retrying, and a restart would not help.
 	require.ErrorIs(t, tr.Ready(t.Context()), errNotConnected)
-	require.ErrorIs(t, tr.Live(t.Context()), errNotConnected)
+	require.NoError(t, tr.Live(t.Context()))
 	_, err = tr.Lag(t.Context())
 	require.ErrorIs(t, err, errNotConnected)
+}
+
+// deadPingStore wraps a store and makes Ping fail, as a MongoDB that stopped
+// answering after the change stream came up.
+type deadPingStore struct {
+	store
+}
+
+func (deadPingStore) Ping(context.Context) error {
+	return errUnreachable
+}
+
+// TestReadyRequiresMongoDBReachable checks that readiness includes MongoDB
+// reachability. A hub whose change stream is up is still not ready when MongoDB
+// stops answering, so an orchestrator keeps it out of rotation. Liveness does
+// not follow it: a restart would not bring MongoDB back.
+func TestReadyRequiresMongoDBReachable(t *testing.T) {
+	opener := staticOpener{st: deadPingStore{store: newMemoryStore()}}
+
+	tr := newTransport(opener, mercure.NewSubscriberList(0), testLogger(), Config{})
+	tr.start()
+
+	t.Cleanup(func() { require.NoError(t, tr.Close(context.Background())) })
+
+	// The consumer connected and caught up, so the change stream is healthy.
+	require.Eventually(t, tr.healthy.Load, 10*time.Second, 10*time.Millisecond)
+
+	require.ErrorIs(t, tr.Ready(t.Context()), errUnreachable)
+	require.NoError(t, tr.Live(t.Context()))
 }
 
 func TestSleepStopsOnContextDone(t *testing.T) {

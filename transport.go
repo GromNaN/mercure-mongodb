@@ -605,8 +605,12 @@ func (t *MongoDBTransport) Lag(ctx context.Context) (int64, error) {
 	return max - t.committed, nil
 }
 
-// Ready reports whether the change stream consumer is connected.
-func (t *MongoDBTransport) Ready(context.Context) error {
+// Ready reports whether the transport can serve traffic. It requires both a
+// connected, caught up change stream consumer and a MongoDB that answers a ping,
+// so a hub that started while MongoDB was down stays out of rotation until it
+// recovered. It combines with the default Caddy and Mercure readiness, which the
+// hub aggregates under /mercure/health/ready.
+func (t *MongoDBTransport) Ready(ctx context.Context) error {
 	select {
 	case <-t.closed:
 		return mercure.ErrClosedTransport
@@ -617,17 +621,9 @@ func (t *MongoDBTransport) Ready(context.Context) error {
 		return errNotConnected
 	}
 
-	return nil
-}
-
-// Live pings MongoDB.
-func (t *MongoDBTransport) Live(ctx context.Context) error {
-	select {
-	case <-t.closed:
-		return mercure.ErrClosedTransport
-	default:
-	}
-
+	// The change stream is up, so MongoDB was reachable. Ping it again to catch
+	// an outage the stream has not reported yet, and to reflect the server
+	// selection state that publish and subscribe depend on.
 	st := t.currentStore()
 	if st == nil {
 		return errNotConnected
@@ -635,6 +631,21 @@ func (t *MongoDBTransport) Live(ctx context.Context) error {
 
 	if err := st.Ping(ctx); err != nil {
 		return fmt.Errorf("MongoDB ping failed: %w", err)
+	}
+
+	return nil
+}
+
+// Live reports whether the transport is alive. It never fails on a MongoDB
+// outage: a restart cannot fix MongoDB, and reporting not alive would restart
+// every hub at once. The consumer reconnects with backoff on its own, so the
+// transport reports not alive only once it is closed. MongoDB reachability is a
+// readiness concern, not a liveness one, so it is checked by Ready alone.
+func (t *MongoDBTransport) Live(context.Context) error {
+	select {
+	case <-t.closed:
+		return mercure.ErrClosedTransport
+	default:
 	}
 
 	return nil

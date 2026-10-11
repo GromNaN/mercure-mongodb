@@ -193,6 +193,12 @@ whether or not MongoDB is ready: it opens the connection on first use and retrie
 with backoff, so it recovers on its own once the replica set finishes
 initializing.
 
+The image ships a healthcheck that reads `/mercure/health/ready` on the Caddy
+admin API, on `127.0.0.1:2019` by default. The hub answers 503 there until the
+change stream is up and MongoDB answers a ping, so the container reports
+unhealthy while MongoDB is unreachable, and the orchestrator keeps it out of
+rotation. Point a Kubernetes readiness probe at the same endpoint.
+
 ```console
 docker network create mercure
 docker run -d --name mongodb --network mercure \
@@ -281,8 +287,9 @@ transport never logs the connection string.
   backoff, so a hub that starts before MongoDB is ready, or while it is down,
   starts anyway and connects on its own. A publish or a subscriber that arrives
   during the outage fails, and the client retries. `Ready` reports not ready
-  until the change stream is up. A definitive failure, such as a wrong password,
-  is logged and retried, never reported as a startup error.
+  until the change stream is up and MongoDB answers a ping, so a hub that
+  started without MongoDB stays out of rotation. A definitive failure, such as a
+  wrong password, is logged and retried, never reported as a startup error.
 - **Count-based retention only.** Retention keeps the newest N updates. There is
   no age-based expiry. Size `retention` above the worst expected subscriber lag,
   because a subscriber that falls further behind than the window is disconnected
@@ -362,9 +369,11 @@ only shared service.
   `updates` can make a reused ID look new.
 - **Reverse proxy.** Configure your proxy to keep SSE connections open: disable
   response buffering and raise the read timeout above the hub heartbeat.
-- **Observability.** The transport exposes `Ready`, `Live` and `Lag`. A hub that
-  reports not ready, or a growing lag, points to a change stream or MongoDB
-  problem.
+- **Observability.** The transport exposes `Ready`, `Live` and `Lag`. `Ready`
+  answers nil only when the change stream is connected and caught up and MongoDB
+  answers a ping. `Live` never fails on a MongoDB outage: a restart cannot fix
+  MongoDB, and it would restart every hub at once. A hub that reports not ready,
+  or a growing lag, points to a change stream or MongoDB problem.
 - **Troubleshooting.** A hub that starts but never reports ready logs the MongoDB
   connection failure: check that the deployment is a replica set and that `uri`
   is set. If clients stop receiving updates, check the change stream health and
