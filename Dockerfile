@@ -18,6 +18,13 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0 AND Apache-2.0"
 COPY ${TARGETPLATFORM}/mercure-mongodb /usr/bin/caddy
 COPY Caddyfile /etc/caddy/Caddyfile
 
+# License and notice files of every work the image redistributes: this
+# transport, the Mercure hub, Caddy, and the Go modules the binary links. The
+# third-party tree is generated at build time by collect-licenses.sh, so it is
+# not committed to the repository.
+COPY LICENSE COPYRIGHT /usr/share/licenses/mercure-mongodb/
+COPY licenses /usr/share/licenses/mercure-mongodb/third-party/
+
 # Transport-aware readiness check on the Caddy admin API (localhost:2019 by default).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
 	CMD ["wget", "-q", "--spider", "http://127.0.0.1:2019/mercure/health/ready"]

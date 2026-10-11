@@ -8,6 +8,10 @@
 *.test
 *.out
 
+# License and notice files, rebuilt from the module cache by
+# .github/scripts/collect-licenses.sh.
+/licenses/
+
 # Editor and OS files.
 .DS_Store
 .idea/

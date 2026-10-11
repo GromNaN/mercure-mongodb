@@ -29,7 +29,7 @@ only provides storage and cross instance synchronization.
 
 ## Table of contents
 
-[How it works](#how-it-works) • [Requirements](#requirements) • [Quick start](#quick-start) • [Docker](#docker) • [Configuration](#configuration) • [Guarantees and limits](#guarantees-and-limits) • [Multi instance](#multi-instance) • [When to use Mercure Enterprise](#when-to-use-mercure-enterprise) • [Production notes](#production-notes) • [Load testing](#load-testing) • [Development](#development) • [License](#license)
+[How it works](#how-it-works) • [Requirements](#requirements) • [Quick start](#quick-start) • [Docker](#docker) • [Configuration](#configuration) • [Guarantees and limits](#guarantees-and-limits) • [Multi instance](#multi-instance) • [When to use Mercure Enterprise](#when-to-use-mercure-enterprise) • [Production notes](#production-notes) • [License](#license)
 
 ## How it works
 
@@ -360,54 +360,27 @@ only shared service.
   a replica set and that `uri` is set. If clients stop receiving updates, check
   the change stream health and the MongoDB logs.
 
-## Load testing
-
-The repository includes a small SSE load generator in [`load`](load). It opens
-many concurrent subscriptions, publishes a stream of updates, and reports the
-publish to client latency.
-
-```console
-go run ./load \
-  -hub http://localhost:3000/.well-known/mercure \
-  -publish-token "$PUBLISHER_JWT" \
-  -subscribe-token "$SUBSCRIBER_JWT" \
-  -clients 2000 -messages 2000
-```
-
-Run it against the hardware and configuration you plan to use, and publish the
-results with that context. The numbers depend on the machine, the network, the
-MongoDB deployment and the topic fan-out. They are not a guarantee for other
-setups.
-
-## Development
-
-Run the unit tests. They need no MongoDB:
-
-```console
-make test
-```
-
-Run the integration tests against a replica set:
-
-```console
-docker compose up -d --wait
-make test-integration
-```
-
-The integration tests are skipped unless `MONGODB_URI` is set. They require a
-replica set, because change streams are not available on a standalone server.
-
 ## License
 
 This project is under the [AGPL 3.0 license](LICENSE).
 
-The image and the release archives bundle three works:
+The image and the release archives bundle four works:
 
-| Work            | License    | License file                                                          |
-| --------------- | ---------- | --------------------------------------------------------------------- |
-| mercure-mongodb | AGPL 3.0   | [`LICENSE`](LICENSE)                                                  |
-| Mercure hub     | AGPL 3.0   | [`LICENSE`](https://github.com/dunglas/mercure/blob/main/LICENSE)     |
-| Caddy           | Apache-2.0 | [`LICENSE`](https://github.com/caddyserver/caddy/blob/master/LICENSE) |
+| Work              | License                                                                      |
+| ----------------- | ---------------------------------------------------------------------------- |
+| mercure-mongodb   | [AGPL 3.0](LICENSE)                                                          |
+| Mercure hub       | [AGPL 3.0](https://github.com/dunglas/mercure/blob/main/LICENSE)             |
+| Caddy             | [Apache-2.0](https://github.com/caddyserver/caddy/blob/master/LICENSE)       |
+| MongoDB Go driver | [Apache-2.0](https://github.com/mongodb/mongo-go-driver/blob/master/LICENSE) |
+
+The hub binary links every module in `go.mod`, so each distribution also carries
+the license and notice files of those modules. They sit under `licenses/` in the
+release archives and under `/usr/share/licenses/mercure-mongodb/` in the image.
+The tree is generated at build time by
+[`collect-licenses.sh`](.github/scripts/collect-licenses.sh) from the Go module
+cache, and it is not committed to the repository. The Mercure `COPYRIGHT`
+notice, which the hub requires to be preserved in any redistribution, is part of
+it.
 
 The hub serves users over a network, so the AGPL network clause applies: if you
 run a modified version, you must offer its source to the users it serves.
