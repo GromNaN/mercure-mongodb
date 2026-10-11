@@ -29,7 +29,7 @@ only provides storage and cross instance synchronization.
 
 ## Table of contents
 
-[How it works](#how-it-works) • [Requirements](#requirements) • [Quick start](#quick-start) • [Docker](#docker) • [Configuration](#configuration) • [Guarantees and limits](#guarantees-and-limits) • [Multi instance](#multi-instance) • [When to use Mercure Enterprise](#when-to-use-mercure-enterprise) • [Production notes](#production-notes) • [Load testing](#load-testing) • [Development](#development) • [License](#license)
+[How it works](#how-it-works) • [Requirements](#requirements) • [Quick start](#quick-start) • [Docker](#docker) • [Configuration](#configuration) • [Guarantees and limits](#guarantees-and-limits) • [Multi instance](#multi-instance) • [When to use Mercure Enterprise](#when-to-use-mercure-enterprise) • [Production notes](#production-notes) • [License](#license)
 
 ## How it works
 
@@ -359,43 +359,6 @@ only shared service.
 - **Troubleshooting.** If the hub refuses to start, check that the deployment is
   a replica set and that `uri` is set. If clients stop receiving updates, check
   the change stream health and the MongoDB logs.
-
-## Load testing
-
-The repository includes a small SSE load generator in [`load`](load). It opens
-many concurrent subscriptions, publishes a stream of updates, and reports the
-publish to client latency.
-
-```console
-go run ./load \
-  -hub http://localhost:3000/.well-known/mercure \
-  -publish-token "$PUBLISHER_JWT" \
-  -subscribe-token "$SUBSCRIBER_JWT" \
-  -clients 2000 -messages 2000
-```
-
-Run it against the hardware and configuration you plan to use, and publish the
-results with that context. The numbers depend on the machine, the network, the
-MongoDB deployment and the topic fan-out. They are not a guarantee for other
-setups.
-
-## Development
-
-Run the unit tests. They need no MongoDB:
-
-```console
-make test
-```
-
-Run the integration tests against a replica set:
-
-```console
-docker compose up -d --wait
-make test-integration
-```
-
-The integration tests are skipped unless `MONGODB_URI` is set. They require a
-replica set, because change streams are not available on a standalone server.
 
 ## License
 
