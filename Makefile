@@ -17,7 +17,7 @@ TARGETPLATFORM ?= $(GOOS)/$(GOARCH)
 # upstream release build; Mercure v1.1.0 no longer reads them.
 HUB_TAGS ?= deprecated_transport,deprecated_topic,deprecated_claim,nobadger,nomysql,nopgx
 
-.PHONY: build build-hub docker test test-integration load fmt vet tidy
+.PHONY: build build-hub docker licenses test test-integration load fmt vet tidy
 
 build:
 	go build ./...
@@ -27,9 +27,15 @@ build-hub:
 	mkdir -p $(TARGETPLATFORM)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -tags '$(HUB_TAGS)' -o $(TARGETPLATFORM)/mercure-mongodb ./caddy/mercure
 
+# Collect the license and notice files of every module the hub binary links.
+# The tree is generated, not committed, and both the image and the release
+# archives copy it in.
+licenses:
+	./.github/scripts/collect-licenses.sh
+
 # Build the container image. The Dockerfile expects the hub binary under the
 # target platform directory, the way GoReleaser lays it out.
-docker: build-hub
+docker: build-hub licenses
 	docker build --build-arg TARGETPLATFORM=$(TARGETPLATFORM) -t mercure-mongodb .
 
 # Unit tests. They run without MongoDB.

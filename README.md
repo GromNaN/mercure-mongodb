@@ -401,13 +401,23 @@ replica set, because change streams are not available on a standalone server.
 
 This project is under the [AGPL 3.0 license](LICENSE).
 
-The image and the release archives bundle three works:
+The image and the release archives bundle four works:
 
-| Work            | License    | License file                                                          |
-| --------------- | ---------- | --------------------------------------------------------------------- |
-| mercure-mongodb | AGPL 3.0   | [`LICENSE`](LICENSE)                                                  |
-| Mercure hub     | AGPL 3.0   | [`LICENSE`](https://github.com/dunglas/mercure/blob/main/LICENSE)     |
-| Caddy           | Apache-2.0 | [`LICENSE`](https://github.com/caddyserver/caddy/blob/master/LICENSE) |
+| Work              | License                                                                      |
+| ----------------- | ---------------------------------------------------------------------------- |
+| mercure-mongodb   | [AGPL 3.0](LICENSE)                                                          |
+| Mercure hub       | [AGPL 3.0](https://github.com/dunglas/mercure/blob/main/LICENSE)             |
+| Caddy             | [Apache-2.0](https://github.com/caddyserver/caddy/blob/master/LICENSE)       |
+| MongoDB Go driver | [Apache-2.0](https://github.com/mongodb/mongo-go-driver/blob/master/LICENSE) |
+
+The hub binary links every module in `go.mod`, so each distribution also carries
+the license and notice files of those modules. They sit under `licenses/` in the
+release archives and under `/usr/share/licenses/mercure-mongodb/` in the image.
+The tree is generated at build time by
+[`collect-licenses.sh`](.github/scripts/collect-licenses.sh) from the Go module
+cache, and it is not committed to the repository. The Mercure `COPYRIGHT`
+notice, which the hub requires to be preserved in any redistribution, is part of
+it.
 
 The hub serves users over a network, so the AGPL network clause applies: if you
 run a modified version, you must offer its source to the users it serves.

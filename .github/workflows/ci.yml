@@ -73,6 +73,11 @@ jobs:
             -tags deprecated_transport,deprecated_topic,deprecated_claim,nobadger,nomysql,nopgx \
             -o linux/amd64/mercure-mongodb ./caddy/mercure
 
+      # The image carries the license files, so generate them the same way the
+      # release does.
+      - name: Collect the license files
+        run: ./.github/scripts/collect-licenses.sh
+
       - name: Build the image
         run: docker build --build-arg TARGETPLATFORM=linux/amd64 -t mercure-mongodb:ci .
 
