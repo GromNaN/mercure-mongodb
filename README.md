@@ -38,7 +38,7 @@ instance opens a change stream on that collection. A publish appends a document;
 the change stream delivers it to every hub, including the one that published, so
 there is a single ordered delivery path and no duplicate.
 
-![Architecture: a publisher posts to any Mercure hub. Each hub inserts one event document into a MongoDB replica set. Every hub reads the collection through a change stream, so an update published on any hub reaches every subscriber on every hub over SSE](docs/architecture.svg)
+![Architecture: a publisher posts to one Mercure hub at a time. That hub inserts one event document into a MongoDB replica set. Every hub reads the collection through a change stream, so the update reaches every subscriber on every hub over SSE](docs/architecture.svg)
 
 On a reconnect, a hub replays the history from MongoDB, then continues with live
 delivery. The change stream carries a resume token, so a hub that restarts picks
