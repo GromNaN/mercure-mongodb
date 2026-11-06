@@ -86,6 +86,38 @@ jobs:
             exit 1
           fi
 
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          tag_pattern = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
+
+          def version(tag):
+              match = tag_pattern.fullmatch(tag)
+              return tuple(map(int, match.groups())) if match else None
+
+          requested_tag = os.environ["TAG"]
+          requested_version = version(requested_tag)
+          existing_tags = subprocess.run(
+              ["git", "tag", "--list"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.splitlines()
+          versions = [(version(tag), tag) for tag in existing_tags if version(tag)]
+
+          if versions:
+              latest_version, latest_tag = max(versions)
+              if requested_version <= latest_version:
+                  print(
+                      f"::error::Tag {requested_tag} must be greater than "
+                      f"the latest version tag {latest_tag}."
+                  )
+                  sys.exit(1)
+          PY
+
           if git show-ref --quiet --verify "refs/tags/$TAG"; then
             echo "::error::Tag $TAG already exists."
             exit 1
