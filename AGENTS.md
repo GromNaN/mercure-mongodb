@@ -132,7 +132,7 @@ in sync.
 1. Start `.github/workflows/cd.yml` manually from `main` with a `vX.Y.Z` tag
    input. The workflow validates and pushes the annotated tag, then publishes
    the release in the same run because tags pushed with `GITHUB_TOKEN` do not
-   trigger other workflows.
+   trigger other workflows. The tag uses the workflow initiator's identity.
 2. `.github/workflows/cd.yml` runs the `check` job: build, vet, unit tests and
    `goreleaser check`. The `release` job needs it.
 3. The `release` job runs GoReleaser, which builds both platforms, creates the
