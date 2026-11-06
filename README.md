@@ -59,8 +59,8 @@ Supported versions:
 
 | Component           | Version          |
 | ------------------- | ---------------- |
-| Mercure             | v1.1.0           |
-| Caddy               | v2.11.7          |
+| Mercure             | v1.1.6           |
+| Caddy               | v2.11.9          |
 | Go                  | 1.27             |
 | MongoDB Go driver   | v2.9.2           |
 | MongoDB server      | 6.0 or newer     |

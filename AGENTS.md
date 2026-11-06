@@ -15,7 +15,7 @@ The design record is
 [`docs/adr/0001-mongodb-transport.md`](docs/adr/0001-mongodb-transport.md). Read
 it before you change the ordering, replay or retention logic.
 
-Target versions: Mercure v1.1.0, Caddy v2.11.7, Go 1.27, MongoDB Go driver v2.
+Target versions: Mercure v1.1.6, Caddy v2.11.9, Go 1.27, MongoDB Go driver v2.
 
 ## Repository layout
 
