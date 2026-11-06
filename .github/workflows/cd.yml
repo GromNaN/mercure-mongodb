@@ -1,11 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
-  # A manual run must target a version tag, so a failed release can be replayed.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to create (for example v1.2.3)"
+        required: true
+        type: string
 
 # One release at a time. Serializing them stops two tag pushes from racing on
 # the :latest tag, and a release that has started is never cancelled.
@@ -24,6 +25,13 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
+      - name: Check the workflow ref
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::This workflow must be run from the main branch."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -61,7 +69,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -70,11 +77,22 @@ jobs:
           check-latest: true
           cache-dependency-path: go.sum
 
-      - name: Check the ref is a version tag
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+      - name: Create and push the version tag
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          echo "::error::This workflow publishes a release, so it must run on a v*.*.* tag ref."
-          exit 1
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag must use the vX.Y.Z format."
+            exit 1
+          fi
+
+          if git show-ref --quiet --verify "refs/tags/$TAG"; then
+            echo "::error::Tag $TAG already exists."
+            exit 1
+          fi
+
+          git tag -a "$TAG" -m "$TAG" "$GITHUB_SHA"
+          git push origin "$TAG"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

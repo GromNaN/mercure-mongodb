@@ -129,11 +129,10 @@ in sync.
 
 ## Release pipeline
 
-1. A `v*.*.*` tag is pushed. `.github/workflows/create-tag.yml` can create a
-   version tag manually from `main`. Since tags pushed with `GITHUB_TOKEN` do
-   not trigger other workflows, start `.github/workflows/cd.yml` manually on
-   the created tag to publish it. The release workflow's `workflow_dispatch`
-   must target a version tag, and the job fails otherwise.
+1. Start `.github/workflows/cd.yml` manually from `main` with a `vX.Y.Z` tag
+   input. The workflow validates and pushes the annotated tag, then publishes
+   the release in the same run because tags pushed with `GITHUB_TOKEN` do not
+   trigger other workflows.
 2. `.github/workflows/cd.yml` runs the `check` job: build, vet, unit tests and
    `goreleaser check`. The `release` job needs it.
 3. The `release` job runs GoReleaser, which builds both platforms, creates the
