@@ -129,9 +129,11 @@ in sync.
 
 ## Release pipeline
 
-1. A `v*.*.*` tag is pushed. That is the only automatic trigger;
-   `workflow_dispatch` must also target a version tag, and the job fails
-   otherwise.
+1. A `v*.*.*` tag is pushed. `.github/workflows/create-tag.yml` can create a
+   version tag manually from `main`. Since tags pushed with `GITHUB_TOKEN` do
+   not trigger other workflows, start `.github/workflows/cd.yml` manually on
+   the created tag to publish it. The release workflow's `workflow_dispatch`
+   must target a version tag, and the job fails otherwise.
 2. `.github/workflows/cd.yml` runs the `check` job: build, vet, unit tests and
    `goreleaser check`. The `release` job needs it.
 3. The `release` job runs GoReleaser, which builds both platforms, creates the
