@@ -7,7 +7,7 @@ require (
 	github.com/dunglas/mercure v1.1.6
 	github.com/dunglas/mercure/caddy v1.1.6
 	github.com/stretchr/testify v1.12.1
-	go.mongodb.org/mongo-driver/v2 v2.9.2
+	go.mongodb.org/mongo-driver/v2 v2.9.3
 )
 
 require (
